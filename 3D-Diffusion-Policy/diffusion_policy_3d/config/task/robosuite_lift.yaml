@@ -1,0 +1,36 @@
+name: robosuite_lift
+
+task_name: Lift
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim, point_cloud
+  obs:
+    point_cloud:
+      shape: [1024, 3]
+      type: point_cloud
+    agent_pos:
+      shape: [9]  # eef_pos(3) + eef_quat(4) + gripper_qpos(2)
+      type: low_dim
+  action:
+    shape: [7]    # from the HDF5 actions shape
+
+env_runner:
+  # We will need to create this runner script for evaluation later
+  _target_: diffusion_policy_3d.env_runner.robosuite_runner.RobosuiteRunner
+  n_train: 20
+  max_steps: 400  # Robosuite episodes are typically longer (default is ~500)
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 20         # Robosuite's default control_freq is 20Hz
+  task_name: Lift
+
+dataset:
+  # This points to the dataset class we will register next
+  _target_: diffusion_policy_3d.dataset.robosuite_dataset.RobosuiteDataset
+  zarr_path: /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/robosuite_lift_expert.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05 # Slightly higher val_ratio since you have a smaller dataset
+  max_train_episodes: 90

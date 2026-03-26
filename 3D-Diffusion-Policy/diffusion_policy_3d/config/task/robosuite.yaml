@@ -1,0 +1,24 @@
+name: robosuite_task
+
+shape_meta: &shape_meta
+  # Observation space: 1024 points (x, y, z) + 9D state (3 pos, 4 quat, 2 gripper)
+  obs:
+    point_cloud:
+      shape: [1024, 3]
+      type: point_cloud
+    agent_pos:
+      shape: [9]
+      type: low_dim
+  # Action space: 7D (3 pos, 3 rot, 1 gripper) -> Adjust if your Robosuite controller differs
+  action:
+    shape: [7]
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.base_dataset.BasePointCloudDataset
+  zarr_path: data/dp3_robosuite_dataset.zarr # Path to the zarr file you just generated
+  horizon: 16
+  pad_before: 1
+  pad_after: 7
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: 90
