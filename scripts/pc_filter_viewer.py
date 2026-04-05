@@ -170,29 +170,29 @@ class PCFilterApp:
         app = gui.Application.instance
         app.initialize()
 
-        self.window = app.create_window("PC Filter Viewer", 1200, 800)
+        self.window = app.create_window("PC Filter Viewer", 1280, 800)
         w = self.window
 
         em = w.theme.font_size
-        margin = gui.Margins(0.5 * em, 0.5 * em, 0.5 * em, 0.5 * em)
+        margin = gui.Margins(int(0.5 * em), int(0.5 * em), int(0.5 * em), int(0.5 * em))
 
-        # 3D scene panel
+        # 3D scene — added directly to window, positioned in _on_layout
         self.scene = gui.SceneWidget()
         self.scene.scene = rendering.Open3DScene(w.renderer)
         self.scene.scene.set_background([0.15, 0.15, 0.15, 1.0])
+        w.add_child(self.scene)
 
-        # Right panel
-        panel = gui.Vert(0, margin)
+        # Right panel — added directly to window, positioned in _on_layout
+        self.panel = gui.Vert(int(0.4 * em), margin)
 
         # Episode selector
-        ep_label = gui.Label(f"Episode (0–{self.n_episodes-1})")
+        self.panel.add_child(gui.Label(f"Episode  (0 – {self.n_episodes - 1})"))
         self.ep_edit = gui.NumberEdit(gui.NumberEdit.INT)
         self.ep_edit.int_value = self.episode_idx
         self.ep_edit.set_limits(0, self.n_episodes - 1)
         self.ep_edit.set_on_value_changed(self._on_episode_change)
-        panel.add_child(ep_label)
-        panel.add_child(self.ep_edit)
-        panel.add_fixed(em)
+        self.panel.add_child(self.ep_edit)
+        self.panel.add_fixed(int(em))
 
         # Sliders for each axis
         db = self.data_bounds
@@ -206,55 +206,43 @@ class PCFilterApp:
             ("z_max", db["z_min"], db["z_max"]),
         ]
         for name, lo, hi in slider_specs:
-            lbl = gui.Label(name.replace("_", " "))
-            sl  = gui.Slider(gui.Slider.DOUBLE)
+            self.panel.add_child(gui.Label(name.replace("_", " ")))
+            sl = gui.Slider(gui.Slider.DOUBLE)
             sl.set_limits(lo, hi)
             sl.double_value = self.bounds[name]
             sl.set_on_value_changed(lambda val, n=name: self._on_slider(n, val))
             self.sliders[name] = sl
-            panel.add_child(lbl)
-            panel.add_child(sl)
+            self.panel.add_child(sl)
 
-        panel.add_fixed(em)
+        self.panel.add_fixed(int(em))
 
         # Info label
         self.info_label = gui.Label("Points inside: –")
-        panel.add_child(self.info_label)
-        panel.add_fixed(em)
+        self.panel.add_child(self.info_label)
+        self.panel.add_fixed(int(em))
 
         # Buttons
         save_btn = gui.Button("Save Config + Write Filtered Zarr")
         save_btn.set_on_clicked(self._on_save)
-        panel.add_child(save_btn)
+        self.panel.add_child(save_btn)
+        self.panel.add_fixed(int(0.5 * em))
 
-        panel.add_fixed(0.5 * em)
         reset_btn = gui.Button("Reset to Full Range")
         reset_btn.set_on_clicked(self._on_reset)
-        panel.add_child(reset_btn)
+        self.panel.add_child(reset_btn)
 
-        # Layout: scene left, panel right
-        layout = gui.Horiz(0, gui.Margins(0, 0, 0, 0))
-        layout.add_child(self.scene)
-        layout.add_fixed(0.5 * em)
-        layout.add_child(panel)
-
-        w.add_child(layout)
+        w.add_child(self.panel)
         w.set_on_layout(self._on_layout)
 
         self._update_scene()
 
+    PANEL_W = 280
+
     def _on_layout(self, layout_context):
         r = self.window.content_rect
-        panel_w = 260
-        self.scene.frame = gui.Rect(r.x, r.y, r.width - panel_w, r.height)
-        panel_x = r.x + r.width - panel_w
-        # find panel widget and set its frame
-        children = self.window.get_children()
-        for c in children:
-            if isinstance(c, gui.Horiz):
-                horiz = c
-                break
-        horiz.frame = gui.Rect(r.x, r.y, r.width, r.height)
+        pw = PCFilterApp.PANEL_W
+        self.scene.frame = gui.Rect(r.x, r.y, r.width - pw, r.height)
+        self.panel.frame  = gui.Rect(r.x + r.width - pw, r.y, pw, r.height)
 
     def _on_slider(self, name: str, val: float):
         self.bounds[name] = val
@@ -404,7 +392,7 @@ def main():
     print(f"Filter config:   {cfg_path}")
     print(f"Preview episode: {args.sample_episode}")
 
-    gui.Application.instance.initialize()
+    # Application.initialize() is called inside PCFilterApp._build_ui()
     app = PCFilterApp(str(zarr_path), str(out_zarr), str(cfg_path), args.sample_episode)
     app.run()
 
