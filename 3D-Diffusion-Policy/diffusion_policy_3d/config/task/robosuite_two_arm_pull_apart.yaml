@@ -1,0 +1,36 @@
+name: robosuite_two_arm_pull_apart
+
+task_name: TwoArmPullApart
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim, point_cloud
+  obs:
+    point_cloud:
+      shape: [1024, 3]
+      type: point_cloud
+    agent_pos:
+      shape: [36]  # robot0_joint_pos(6) + robot0_gripper_qpos(6)
+                   # + robot1_joint_pos(6) + robot1_gripper_qpos(6)
+                   # + robot0_wrist_ft(6)  + robot1_wrist_ft(6)
+      type: low_dim
+  action:
+    shape: [7]     # arm1: joint_delta(6) + gripper(1)  (arm0 fixed by env)
+
+env_runner:
+  _target_: diffusion_policy_3d.env_runner.robosuite_two_arm_pull_apart_runner.RobosuiteTwoArmPullApartRunner
+  n_train: 20
+  max_steps: 600
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 20
+  task_name: TwoArmPullApart
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.robosuite_dataset.RobosuiteDataset
+  zarr_path: /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/pull_apart_demo.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
