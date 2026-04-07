@@ -44,3 +44,7 @@ personal_TASK.md
 easytrain.sh
 nohup.out
 output/
+third_party/VRL3/vrl3_ckpts/
+third_party/VRL3/vrl3_ckpts.zip
+third_party/dexart-release/dexart_assets.zip
+third_party/dexart-release/assets/
