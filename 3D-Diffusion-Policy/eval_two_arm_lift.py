@@ -21,7 +21,7 @@ import yaml
 
 # Ensure the full robosuite installation (with camera_utils) takes precedence
 # over the stub package installed in the conda env.
-_ROBOSUITE_ROOT = "/home/rosi/robosuite"
+_ROBOSUITE_ROOT = "/home/swapneel_hmgics/workspace/robosuite"
 if _ROBOSUITE_ROOT not in sys.path:
     sys.path.insert(0, _ROBOSUITE_ROOT)
 
@@ -220,7 +220,7 @@ def main():
                         help="Device override, e.g. 'cpu' or 'cuda:0'. "
                              "Defaults to cuda if available.")
     parser.add_argument("--collect-config", type=str,
-                        default="/home/rosi/robosuite/collect_config.yaml",
+                        default="/home/swapneel_hmgics/workspace/robosuite/collect_config.yaml",
                         help="Path to collect_config.yaml for cable placement. "
                              "Pass '' to disable (use robosuite default randomisation).")
     parser.add_argument("--inference-steps", type=int, default=3,
