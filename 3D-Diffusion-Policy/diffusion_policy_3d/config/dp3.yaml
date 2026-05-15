@@ -27,9 +27,9 @@ policy:
   
   diffusion_step_embed_dim: 64
   down_dims:
-  - 64
   - 128
   - 256
+  - 512
   crop_shape:
   - 80
   - 80
