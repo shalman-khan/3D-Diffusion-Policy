@@ -13,7 +13,7 @@ Each trial has two bags:
 Processing per trial:
   1. Read all messages from both bags via rosbag2_py
   2. Synchronise to a 20 Hz timeline using nearest-neighbour per-topic
-  3. Parse PointCloud2 → XYZ numpy array, crop workspace, FPS downsample to 1024
+  3. Parse PointCloud2 → XYZRGB numpy array, crop workspace, FPS downsample to 1024
   4. Build agent_pos (14-dim) and action (joint delta, 14-dim)
   5. Append episode to zarr
 
@@ -81,10 +81,11 @@ def read_all_messages(bag_path: str, topic_names: list) -> dict:
     return result
 
 
-def parse_pointcloud2_xyz(msg) -> np.ndarray:
+def parse_pointcloud2_xyzrgb(msg) -> np.ndarray:
     """
-    Parse PointCloud2 message (XYZ + RGB, point_step=20) into (N,3) float32.
-    Layout: x(0,f32) y(4,f32) z(8,f32) pad(12,u32) rgb(16,f32)
+    Parse PointCloud2 message (XYZ + RGB, point_step=20) into (N,6) float32.
+    Layout: x(0,f32) y(4,f32) z(8,f32) pad(12,u32) rgb(16,f32-packed-uint32)
+    RGB packed as uint32: bits [23:16]=R [15:8]=G [7:0]=B, normalised to [0,1].
     """
     dt = np.dtype([
         ("x",   np.float32),
@@ -95,7 +96,11 @@ def parse_pointcloud2_xyz(msg) -> np.ndarray:
     ])
     arr = np.frombuffer(bytes(msg.data), dtype=dt)
     xyz = np.column_stack([arr["x"], arr["y"], arr["z"]])
-    return xyz
+    rgb_int = arr["rgb"].view(np.uint32)
+    r = ((rgb_int >> 16) & 0xFF).astype(np.float32) / 255.0
+    g = ((rgb_int >> 8)  & 0xFF).astype(np.float32) / 255.0
+    b = ( rgb_int        & 0xFF).astype(np.float32) / 255.0
+    return np.column_stack([xyz, r, g, b])
 
 
 def crop_workspace(xyz: np.ndarray, ws: dict) -> np.ndarray:
@@ -111,14 +116,15 @@ def crop_workspace(xyz: np.ndarray, ws: dict) -> np.ndarray:
 
 def fps_numpy(points: np.ndarray, n_samples: int, pre_subsample: int = 8192) -> np.ndarray:
     """
-    Farthest Point Sampling (CPU, numpy).
+    Farthest Point Sampling (CPU, numpy). Distances computed on XYZ only;
+    all feature channels (e.g. RGB) are preserved in the output.
     Pre-subsamples randomly to `pre_subsample` points before FPS to keep
     runtime manageable on dense real-world point clouds (~150k points).
-    FPS spatial coverage is preserved since 8192 >> 1024.
     """
+    n_features = points.shape[1]
     n = len(points)
     if n == 0:
-        return np.zeros((n_samples, 3), dtype=np.float32)
+        return np.zeros((n_samples, n_features), dtype=np.float32)
     if n <= n_samples:
         idx = np.random.choice(n, n_samples, replace=True)
         return points[idx].astype(np.float32)
@@ -129,12 +135,13 @@ def fps_numpy(points: np.ndarray, n_samples: int, pre_subsample: int = 8192) -> 
         points = points[idx]
         n = pre_subsample
 
+    xyz = points[:, :3].astype(np.float64)   # use only XYZ for spatial distances
     selected = np.zeros(n_samples, dtype=np.int64)
     distances = np.full(n, np.inf, dtype=np.float64)
     selected[0] = np.random.randint(n)
     for i in range(1, n_samples):
-        last = points[selected[i - 1]].astype(np.float64)
-        d = np.sum((points.astype(np.float64) - last) ** 2, axis=1)
+        last = xyz[selected[i - 1]]
+        d = np.sum((xyz - last) ** 2, axis=1)
         distances = np.minimum(distances, d)
         selected[i] = np.argmax(distances)
     return points[selected].astype(np.float32)
@@ -253,9 +260,9 @@ def process_trial(trial_n: int, cfg: dict) -> tuple:
             continue
 
         # Point cloud
-        xyz = parse_pointcloud2_xyz(pc_msg)
-        xyz = crop_workspace(xyz, ws)
-        pc  = fps_numpy(xyz, n_pts)  # (1024, 3)
+        xyzrgb = parse_pointcloud2_xyzrgb(pc_msg)
+        xyzrgb = crop_workspace(xyzrgb, ws)
+        pc     = fps_numpy(xyzrgb, n_pts)  # (1024, 6)
 
         # Joint positions in canonical order
         r1_pos = extract_joint_positions(r1_msg, jn["robot1"])   # (6,)
@@ -274,7 +281,7 @@ def process_trial(trial_n: int, cfg: dict) -> tuple:
         print(f"[Trial {trial_n}] SKIP — only {len(point_clouds)} valid frames")
         return None, None, None
 
-    point_clouds = np.stack(point_clouds, axis=0).astype(np.float32)   # (T, 1024, 3)
+    point_clouds = np.stack(point_clouds, axis=0).astype(np.float32)   # (T, 1024, 6)
     agent_pos    = np.stack(agent_pos_list, axis=0).astype(np.float32)  # (T, 14)
 
     # Compute actions as joint delta: action[t] = state[t+1] - state[t]
@@ -301,7 +308,7 @@ def write_zarr(zarr_path: str, episodes: list):
     episodes: list of (point_clouds, agent_pos, actions) tuples
     Zarr structure:
       data/
-        point_cloud   (total_steps, 1024, 3)
+        point_cloud   (total_steps, 1024, 6)  — XYZRGB, RGB normalised [0,1]
         state         (total_steps, 14)
         action        (total_steps, 14)
       meta/
@@ -312,8 +319,9 @@ def write_zarr(zarr_path: str, episodes: list):
 
     total_steps = sum(len(pc) for pc, _, _ in episodes)
     n_ep = len(episodes)
+    n_features = episodes[0][0].shape[-1]  # 6 for XYZRGB
 
-    pc_arr  = store.zeros("data/point_cloud", shape=(total_steps, 1024, 3), dtype="f4", chunks=(1, 1024, 3), compressor=compressor)
+    pc_arr  = store.zeros("data/point_cloud", shape=(total_steps, 1024, n_features), dtype="f4", chunks=(1, 1024, n_features), compressor=compressor)
     st_arr  = store.zeros("data/state",       shape=(total_steps, 14),      dtype="f4", chunks=(1, 14),      compressor=compressor)
     ac_arr  = store.zeros("data/action",      shape=(total_steps, 14),      dtype="f4", chunks=(1, 14),      compressor=compressor)
     ep_ends = store.zeros("meta/episode_ends", shape=(n_ep,), dtype="i8")

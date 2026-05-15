@@ -5,7 +5,7 @@ rosbag_to_zarr.py
 Converts all rosbags in a folder to a single DP3-compatible zarr dataset.
 
 For each bag (= one episode) at 20 Hz:
-  - Reconstructs point cloud from depth + camera_info
+  - Reconstructs XYZRGB point cloud from depth + RGB + camera_info
   - Applies Z filter (from z_filter_config.yaml)
   - FPS-downsamples to 1024 points
   - Extracts joint states: [robot1(6), gripper1(1), robot2(6), gripper2(1)] = 14-D
@@ -14,7 +14,7 @@ For each bag (= one episode) at 20 Hz:
 Zarr keys written:
   data/state       (T, 14)   current joint positions
   data/action      (T, 14)   joint positions at t+1 (absolute)
-  data/point_cloud (T, 1024, 3)
+  data/point_cloud (T, 1024, 6)  XYZRGB, RGB normalised [0, 1]
 
 Usage:
     python3 rosbag_to_zarr.py \
@@ -49,7 +49,7 @@ GRIPPER1_TOPIC = "/gripper1/joint_states"
 GRIPPER2_TOPIC = "/gripper2/joint_states"
 DEPTH_TOPIC    = "/zed/zed_node/depth/depth_registered"
 CAM_INFO_TOPIC = "/zed/zed_node/depth/camera_info"
-RGB_TOPIC      = "/zed/zed_node/rgb/color/rect/image"   # not used for PC but kept for reference
+RGB_TOPIC      = "/zed/zed_node/rgb/image_rect_color"
 
 CONFIG_PATH = Path(__file__).parent / "z_filter_config.yaml"
 
@@ -81,7 +81,7 @@ def read_bag_messages(db3_path: Path):
     topic_interest = {
         ROBOT1_TOPIC, ROBOT2_TOPIC,
         GRIPPER1_TOPIC, GRIPPER2_TOPIC,
-        DEPTH_TOPIC, CAM_INFO_TOPIC,
+        DEPTH_TOPIC, CAM_INFO_TOPIC, RGB_TOPIC,
     }
 
     msg_type_map = {
@@ -91,6 +91,7 @@ def read_bag_messages(db3_path: Path):
         GRIPPER2_TOPIC: JointState,
         DEPTH_TOPIC:    Image,
         CAM_INFO_TOPIC: CameraInfo,
+        RGB_TOPIC:      Image,
     }
 
     data = {t: [] for t in topic_interest}
@@ -126,9 +127,9 @@ def nearest_msg(messages, query_ns):
     return before[1]
 
 
-def depth_to_pointcloud(depth_msg: Image, cam_msg: CameraInfo,
+def depth_to_pointcloud(depth_msg: Image, cam_msg: CameraInfo, rgb_msg: Image,
                          z_min: float, z_max: float, n_points: int):
-    """Reconstruct point cloud, apply Z filter, FPS-downsample to n_points."""
+    """Reconstruct XYZRGB point cloud, apply Z filter, FPS-downsample to n_points."""
     h, w = depth_msg.height, depth_msg.width
     depth = np.frombuffer(bytes(depth_msg.data), dtype=np.float32).reshape(h, w)
 
@@ -144,7 +145,25 @@ def depth_to_pointcloud(depth_msg: Image, cam_msg: CameraInfo,
     valid = (np.isfinite(pts[:, 2]) & (pts[:, 2] >= z_min) & (pts[:, 2] <= z_max))
     pts = pts[valid]
 
-    return fps_or_pad(pts, n_points)
+    # Extract per-pixel RGB aligned to the depth image
+    raw = np.frombuffer(bytes(rgb_msg.data), dtype=np.uint8)
+    enc = rgb_msg.encoding
+    if enc in ("bgra8", "rgba8"):
+        img = raw.reshape(h, w, 4)
+        if enc == "bgra8":
+            r_ch, g_ch, b_ch = img[:, :, 2], img[:, :, 1], img[:, :, 0]
+        else:
+            r_ch, g_ch, b_ch = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+    else:  # rgb8
+        img = raw.reshape(h, w, 3)
+        r_ch, g_ch, b_ch = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+
+    r = r_ch.reshape(-1)[valid].astype(np.float32) / 255.0
+    g = g_ch.reshape(-1)[valid].astype(np.float32) / 255.0
+    b = b_ch.reshape(-1)[valid].astype(np.float32) / 255.0
+    pts_rgb = np.column_stack([pts, r, g, b])
+
+    return fps_or_pad(pts_rgb, n_points)
 
 
 FPS_PRESAMPLE = 8192   # random subsample before FPS — keeps FPS fast
@@ -153,16 +172,19 @@ FPS_PRESAMPLE = 8192   # random subsample before FPS — keeps FPS fast
 def fps_or_pad(pts: np.ndarray, n: int) -> np.ndarray:
     """
     Downsample to n points, zero-pad if fewer than n points.
+    Distances computed on XYZ only; all feature channels are preserved.
 
     Strategy:
       1. Random subsample to FPS_PRESAMPLE (fast, reduces O(N^2) FPS cost)
       2. FPS on the small set to get exactly n well-spread points
     """
+    n_features = pts.shape[1]
+
     if len(pts) == 0:
-        return np.zeros((n, 3), dtype=np.float32)
+        return np.zeros((n, n_features), dtype=np.float32)
 
     if len(pts) <= n:
-        pad = np.zeros((n - len(pts), 3), dtype=np.float32)
+        pad = np.zeros((n - len(pts), n_features), dtype=np.float32)
         return np.vstack([pts, pad]).astype(np.float32)
 
     # Step 1: random pre-subsample so FPS runs on at most FPS_PRESAMPLE points
@@ -171,16 +193,17 @@ def fps_or_pad(pts: np.ndarray, n: int) -> np.ndarray:
         pts = pts[idx_pre]
 
     if len(pts) <= n:
-        pad = np.zeros((n - len(pts), 3), dtype=np.float32)
+        pad = np.zeros((n - len(pts), n_features), dtype=np.float32)
         return np.vstack([pts, pad]).astype(np.float32)
 
-    # Step 2: FPS on the pre-sampled set
+    # Step 2: FPS on the pre-sampled set (XYZ only for distance)
+    xyz = pts[:, :3]
     idx = np.zeros(n, dtype=np.int64)
     dists = np.full(len(pts), np.inf)
     cur = 0
     for i in range(n):
         idx[i] = cur
-        d = np.sum((pts - pts[cur]) ** 2, axis=1)
+        d = np.sum((xyz - xyz[cur]) ** 2, axis=1)
         dists = np.minimum(dists, d)
         cur = int(np.argmax(dists))
     return pts[idx].astype(np.float32)
@@ -206,7 +229,7 @@ def process_bag(bag_dir: Path, z_min: float, z_max: float,
     msgs = read_bag_messages(db3[0])
 
     for topic in [ROBOT1_TOPIC, ROBOT2_TOPIC, GRIPPER1_TOPIC, GRIPPER2_TOPIC,
-                  DEPTH_TOPIC, CAM_INFO_TOPIC]:
+                  DEPTH_TOPIC, CAM_INFO_TOPIC, RGB_TOPIC]:
         if not msgs[topic]:
             print(f"  [SKIP] Missing topic {topic} in {bag_dir.name}")
             return None
@@ -250,6 +273,7 @@ def process_bag(bag_dir: Path, z_min: float, z_max: float,
         g1  = nearest_msg(msgs[GRIPPER1_TOPIC], ts)
         g2  = nearest_msg(msgs[GRIPPER2_TOPIC], ts)
         dep = nearest_msg(msgs[DEPTH_TOPIC],    ts)
+        rgb = nearest_msg(msgs[RGB_TOPIC],     ts)
 
         r1_q = extract_joint_state(r1)   # (6,)
         r2_q = extract_joint_state(r2)   # (6,)
@@ -259,14 +283,14 @@ def process_bag(bag_dir: Path, z_min: float, z_max: float,
         state = np.concatenate([r1_q, g1_q, r2_q, g2_q])  # (14,)
         states.append(state)
 
-        pc = depth_to_pointcloud(dep, cam_info, z_min, z_max, n_points)
+        pc = depth_to_pointcloud(dep, cam_info, rgb, z_min, z_max, n_points)
         pointclouds.append(pc)
 
     if skipped_stale:
         print(f"  Skipped {skipped_stale} stale ticks (pause periods with no joint state)")
 
     states      = np.array(states,      dtype=np.float32)  # (T, 14)
-    pointclouds = np.array(pointclouds, dtype=np.float32)  # (T, 1024, 3)
+    pointclouds = np.array(pointclouds, dtype=np.float32)  # (T, 1024, 6)
 
     # Action = absolute joint state at t+1 (last step repeats)
     actions = np.concatenate([states[1:], states[-1:]], axis=0)  # (T, 14)

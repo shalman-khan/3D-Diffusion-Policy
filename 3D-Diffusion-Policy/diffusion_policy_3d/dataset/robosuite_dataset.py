@@ -85,9 +85,9 @@ class RobosuiteDataset(BaseDataset):
         T, N, _ = point_cloud.shape
         dropout_mask = np.random.rand(T, N) < 0.15
         point_cloud[dropout_mask] = 0.0
-        # Random uniform scale: ±5% size perturbation across whole cloud
+        # Random uniform scale: ±5% size perturbation on XYZ only (not RGB)
         scale = np.float32(np.random.uniform(0.95, 1.05))
-        point_cloud = point_cloud * scale
+        point_cloud[..., :3] *= scale
         return point_cloud
 
     def _sample_to_data(self, sample):

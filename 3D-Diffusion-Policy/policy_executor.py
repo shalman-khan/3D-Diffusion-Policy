@@ -58,6 +58,7 @@ ROBOT2_IP = "192.168.1.20"
 # Only camera topics come from ROS2 — robot/gripper state is read via RTDE
 DEPTH_TOPIC    = "/zed/zed_node/depth/depth_registered"
 CAM_INFO_TOPIC = "/zed/zed_node/depth/camera_info"
+RGB_TOPIC      = "/zed/zed_node/rgb/image_rect_color"
 
 N_POINTS = 1024
 
@@ -72,10 +73,10 @@ def load_z_filter():
     return 0.1, 1.5
 
 
-def depth_to_pointcloud(depth_msg: Image, cam_msg: CameraInfo,
+def depth_to_pointcloud(depth_msg: Image, cam_msg: CameraInfo, rgb_msg: Image,
                          z_min: float, z_max: float,
                          n_points: int = N_POINTS) -> np.ndarray:
-    """Reconstruct point cloud from depth + camera_info, matching training pipeline."""
+    """Reconstruct XYZRGB point cloud from depth + RGB + camera_info, matching training pipeline."""
     h, w = depth_msg.height, depth_msg.width
     depth = np.frombuffer(bytes(depth_msg.data), dtype=np.float32).reshape(h, w)
 
@@ -89,31 +90,53 @@ def depth_to_pointcloud(depth_msg: Image, cam_msg: CameraInfo,
 
     pts = np.stack([x, y, z], axis=-1).reshape(-1, 3)
     valid = np.isfinite(pts[:, 2]) & (pts[:, 2] >= z_min) & (pts[:, 2] <= z_max)
-    return fps_or_pad(pts[valid], n_points)
+    pts = pts[valid]
+
+    # Extract per-pixel RGB aligned to the depth image
+    raw = np.frombuffer(bytes(rgb_msg.data), dtype=np.uint8)
+    enc = rgb_msg.encoding
+    if enc in ("bgra8", "rgba8"):
+        img = raw.reshape(h, w, 4)
+        if enc == "bgra8":
+            r_ch, g_ch, b_ch = img[:, :, 2], img[:, :, 1], img[:, :, 0]
+        else:
+            r_ch, g_ch, b_ch = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+    else:  # rgb8
+        img = raw.reshape(h, w, 3)
+        r_ch, g_ch, b_ch = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+
+    r = r_ch.reshape(-1)[valid].astype(np.float32) / 255.0
+    g = g_ch.reshape(-1)[valid].astype(np.float32) / 255.0
+    b = b_ch.reshape(-1)[valid].astype(np.float32) / 255.0
+    pts_rgb = np.column_stack([pts, r, g, b])
+
+    return fps_or_pad(pts_rgb, n_points)
 
 
 FPS_PRESAMPLE = 8192   # random pre-subsample before FPS — keeps each frame <0.1s
 
 
 def fps_or_pad(pts: np.ndarray, n: int) -> np.ndarray:
+    n_features = pts.shape[1]
     if len(pts) == 0:
-        return np.zeros((n, 3), dtype=np.float32)
+        return np.zeros((n, n_features), dtype=np.float32)
     if len(pts) <= n:
-        pad = np.zeros((n - len(pts), 3), dtype=np.float32)
+        pad = np.zeros((n - len(pts), n_features), dtype=np.float32)
         return np.vstack([pts, pad]).astype(np.float32)
     # Random pre-subsample so FPS runs on at most FPS_PRESAMPLE points
     if len(pts) > FPS_PRESAMPLE:
         idx_pre = np.random.choice(len(pts), FPS_PRESAMPLE, replace=False)
         pts = pts[idx_pre]
     if len(pts) <= n:
-        pad = np.zeros((n - len(pts), 3), dtype=np.float32)
+        pad = np.zeros((n - len(pts), n_features), dtype=np.float32)
         return np.vstack([pts, pad]).astype(np.float32)
+    xyz  = pts[:, :3]   # use only XYZ for spatial distances
     idx  = np.zeros(n, dtype=np.int64)
     dists = np.full(len(pts), np.inf)
     cur  = 0
     for i in range(n):
         idx[i] = cur
-        d = np.sum((pts - pts[cur]) ** 2, axis=1)
+        d = np.sum((xyz - xyz[cur]) ** 2, axis=1)
         dists = np.minimum(dists, d)
         cur = int(np.argmax(dists))
     return pts[idx].astype(np.float32)
@@ -122,7 +145,7 @@ def fps_or_pad(pts: np.ndarray, n: int) -> np.ndarray:
 # ── ROS2 sensor node ──────────────────────────────────────────────────────────
 
 class CameraNode(Node):
-    """Subscribes to ZED depth + camera_info, matching the training pipeline exactly."""
+    """Subscribes to ZED depth + RGB + camera_info, matching the training pipeline exactly."""
 
     def __init__(self):
         super().__init__("dp3_camera_node")
@@ -133,15 +156,20 @@ class CameraNode(Node):
 
         self.depth_msg    = None
         self.cam_info_msg = None
+        self.rgb_msg      = None
 
         self.create_subscription(Image,      DEPTH_TOPIC,    self._depth_cb,   be)
         self.create_subscription(CameraInfo, CAM_INFO_TOPIC, self._caminfo_cb, be)
+        self.create_subscription(Image,      RGB_TOPIC,      self._rgb_cb,     be)
 
     def _depth_cb(self, m):   self.depth_msg    = m
     def _caminfo_cb(self, m): self.cam_info_msg = m
+    def _rgb_cb(self, m):     self.rgb_msg      = m
 
     def ready(self) -> bool:
-        return self.depth_msg is not None and self.cam_info_msg is not None
+        return (self.depth_msg is not None
+                and self.cam_info_msg is not None
+                and self.rgb_msg is not None)
 
 
 # ── RTDE robot interface ──────────────────────────────────────────────────────
@@ -196,21 +224,29 @@ class BimanualRTDE:
         """Send gripper command non-blocking via daemon thread.
         Skipped if change < min_change to avoid blocking on every loop.
         which: 1 = robot1 gripper, 2 = robot2 gripper
+        Uses sendCustomScript (port 30002) — works alongside External Control URCap.
         """
         cur = self._g1_pos if which == 1 else self._g2_pos
         if abs(position_01 - cur) < min_change:
             return   # no meaningful change — skip to avoid blocking
 
         pos_byte = int(np.clip(position_01, 0.0, 1.0) * 255)
-        script = f"def set_gripper():\n  rq_set_pos({pos_byte})\nend\n"
+        print(f"[GRIPPER] gripper{which}: {cur:.2f}→{position_01:.2f}  (pos_byte={pos_byte})")
+        # Plain URScript — rq_set_pos is a Robotiq URCap built-in.
+        # sendCustomScript sends to port 30002 and executes immediately,
+        # which works alongside External Control (unlike sendCustomScriptFunction).
+        script = f"def grip():\n  rq_set_pos({pos_byte})\nend\ngrip()\n"
         rc     = self.rc1 if which == 1 else self.rc2
 
         # Fire-and-forget — never block the control loop
         def _send():
             try:
-                rc.sendCustomScriptFunction("set_gripper", script)
-            except Exception:
-                pass
+                ok = rc.sendCustomScript(script)
+                if not ok:
+                    print(f"[WARN] gripper{which} sendCustomScript returned False "
+                          f"(pos={pos_byte})")
+            except Exception as e:
+                print(f"[WARN] gripper{which} command failed: {e}")
 
         t = threading.Thread(target=_send, daemon=True)
         t.start()
@@ -277,7 +313,7 @@ def run(args):
     rclpy.init()
     camera = CameraNode()
 
-    print("Waiting for ZED depth + camera_info ...")
+    print("Waiting for ZED depth + RGB + camera_info ...")
     import threading
     spin_thread = threading.Thread(target=rclpy.spin, args=(camera,), daemon=True)
     spin_thread.start()
@@ -295,7 +331,7 @@ def run(args):
         print(f"Inference steps: {args.infer_steps}")
 
     # ── Warm up GPU ───────────────────────────────────────────────────────────
-    dummy_pc  = torch.zeros(1, 2, N_POINTS, 3).to(device)
+    dummy_pc  = torch.zeros(1, 2, N_POINTS, 6).to(device)
     dummy_pos = torch.zeros(1, 2, 14).to(device)
     for _ in range(3):
         t_w = time.time()
@@ -316,7 +352,7 @@ def run(args):
         interval = 1.0 / args.hz   # 50ms
         while not stop_obs.is_set():
             t0 = time.time()
-            pc    = depth_to_pointcloud(camera.depth_msg, camera.cam_info_msg, z_min, z_max)
+            pc    = depth_to_pointcloud(camera.depth_msg, camera.cam_info_msg, camera.rgb_msg, z_min, z_max)
             state = robots.get_state()
             with obs_lock:
                 obs_ring.append((pc, state))
@@ -328,24 +364,30 @@ def run(args):
     obs_thread = threading.Thread(target=obs_worker, daemon=True)
 
     # ── Kickstart: nudge robot2 wrist to seed nonzero velocity ───────────────
-    # Policy needs obs[t-1] != obs[t] to exit the static attractor.
-    # Nudge size matches typical teleop start velocity in training demos.
-    print("Kickstart: recording pre-nudge state ...")
+    # Training data had static frames filtered out, so the policy has never
+    # seen obs[t-1]==obs[t]. At inference the robot starts static — an OOD
+    # input. The nudge seeds a small velocity to match the training distribution.
+    # Skip with --no_kickstart if demos included motion from frame 1.
     obs_thread.start()
     time.sleep(0.12)   # wait for 2 obs at 50ms spacing to fill the ring
 
-    print("Kickstart: nudging robot2 wrist +0.08 rad ...")
-    q1_cur, q2_cur = robots.get_joints()
-    q2_nudge = q2_cur.copy()
-    q2_nudge[5] += 0.08   # wrist3 nudge — visible velocity signal
-    for q2_wp in interpolate_waypoints(q2_cur, q2_nudge, interp_steps):
-        robots.servoJ_step(q1_cur, q2_wp)
-        time.sleep(1.0 / args.rtde_hz)
-    time.sleep(0.06)   # let obs thread capture post-nudge state
+    if not args.no_kickstart:
+        print("Kickstart: nudging robot2 wrist +0.08 rad ...")
+        q1_cur, q2_cur = robots.get_joints()
+        q2_nudge = q2_cur.copy()
+        q2_nudge[5] += 0.08   # wrist3 nudge — visible velocity signal
+        for q2_wp in interpolate_waypoints(q2_cur, q2_nudge, interp_steps):
+            robots.servoJ_step(q1_cur, q2_wp)
+            time.sleep(1.0 / args.rtde_hz)
+        time.sleep(0.06)   # let obs thread capture post-nudge state
 
-    with obs_lock:
-        vel_seed = np.abs(obs_ring[-1][1] - obs_ring[0][1]).max() if len(obs_ring) == 2 else 0
-    print(f"Kickstart done — velocity seeded: {vel_seed:.4f} rad\n")
+        with obs_lock:
+            vel_seed = np.abs(obs_ring[-1][1] - obs_ring[0][1]).max() if len(obs_ring) == 2 else 0
+        print(f"Kickstart done — velocity seeded: {vel_seed:.4f} rad\n")
+    else:
+        print("Kickstart disabled (--no_kickstart). Waiting for obs ring to fill ...")
+        time.sleep(0.15)
+        print("Obs ring ready.\n")
 
     # ── Async inference thread ────────────────────────────────────────────────
     # Inference (65ms) and execution (n_action_steps×48ms) run in parallel.
@@ -383,12 +425,22 @@ def run(args):
             vel       = np.abs(obs_b[1] - obs_a[1]).max()
             raw_delta = actions[0] - state_now
             print(f"  infer={infer_ms:4.0f}ms  vel={vel:.4f}  "
+                  f"r1={np.abs(raw_delta[0:6]).max():.4f}  "
                   f"r2={np.abs(raw_delta[7:13]).max():.4f}  "
                   f"g2={state_now[13]:.2f}→{actions[0,13]:.2f}")
 
-            # Safety clamp — only robot2 moves, robot1 locked
             for step_i in range(len(actions)):
-                actions[step_i, 0:6] = state_now[0:6]
+                if args.lock_robot1:
+                    # Freeze robot1 — use for single-arm testing
+                    actions[step_i, 0:6] = state_now[0:6]
+                else:
+                    # Robot1: delta clamp only (add hard joint limits here once known)
+                    for j in range(6):
+                        delta = np.clip(actions[step_i, j] - state_now[j],
+                                        -args.max_step, args.max_step)
+                        actions[step_i, j] = state_now[j] + delta * args.action_scale
+
+                # Robot2: delta clamp + hard joint bounds from recorded workspace
                 for j in range(6):
                     idx   = 7 + j
                     delta = np.clip(actions[step_i, idx] - state_now[idx],
@@ -434,18 +486,18 @@ def run(args):
                     if wait > 0:
                         time.sleep(wait)
 
-                # Gripper commands disabled — rq_set_pos URScript conflicts
-                # with External Control program. Enable once URCap confirmed.
-                # robots.set_gripper(1, g1_target)
-                # robots.set_gripper(2, g2_target)
+                # Gripper control via rq_set_pos URScript (fire-and-forget thread).
+                # Requires Robotiq URCap installed on the UR controller.
+                # If this causes External Control conflicts, disable with --no_gripper.
+                if not args.no_gripper:
+                    robots.set_gripper(1, float(g1_target))
+                    robots.set_gripper(2, float(g2_target))
 
             # 5. Get next action (inference thread should have it ready)
             try:
                 actions = action_queue.get(timeout=0.5)
             except _queue.Empty:
                 print("[WARN] inference too slow — holding last action")
-
-            loop_count += 1
 
             loop_count += 1
 
@@ -477,6 +529,12 @@ def main():
                         help="Amplify predicted delta on robot2 only (default 1.0 = no amplification).")
     parser.add_argument("--max_step",      type=float, default=0.05,
                         help="Max joint delta per step in rad before scaling (safety clamp, default 0.05)")
+    parser.add_argument("--no_kickstart",  action="store_true",
+                        help="Skip the wrist nudge. Use if training demos started from rest (static start is in-distribution).")
+    parser.add_argument("--lock_robot1",   action="store_true",
+                        help="Freeze robot1 joints — only robot2 moves. Use for single-arm testing.")
+    parser.add_argument("--no_gripper",    action="store_true",
+                        help="Disable gripper commands. Use if rq_set_pos conflicts with External Control URCap.")
     args = parser.parse_args()
     run(args)
 

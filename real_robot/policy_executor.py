@@ -6,7 +6,7 @@ ROS2 node that loads a trained DP3 checkpoint and runs closed-loop policy
 execution on the real robot.
 
 Observation pipeline (same topics as rosbag recording):
-  /camera/camera/depth/color/points  → point_cloud (1024×3)
+  /camera/camera/depth/color/points  → point_cloud (1024×6, XYZRGB)
   /robot1/joint_states               → agent_pos[0:6]
   /gripper1/joint_states             → agent_pos[6]
   /robot2/joint_states               → agent_pos[7:13]
@@ -47,7 +47,7 @@ from builtin_interfaces.msg import Duration
 sys.path.insert(0, str(Path(__file__).parent.parent / "3D-Diffusion-Policy"))
 
 from diffusion_policy_3d.workspace.train_dp3_workspace import TrainDP3Workspace
-from convert_rosbags_to_zarr import parse_pointcloud2_xyz, crop_workspace, fps_numpy
+from convert_rosbags_to_zarr import parse_pointcloud2_xyzrgb, crop_workspace, fps_numpy
 
 
 # ---------------------------------------------------------------------------
@@ -207,9 +207,9 @@ class PolicyExecutorNode(Node):
             return None
 
         # Point cloud
-        xyz = parse_pointcloud2_xyz(self._latest_pc)
-        xyz = crop_workspace(xyz, self.ws)
-        pc  = fps_numpy(xyz, self.n_pts)   # (1024, 3)
+        xyzrgb = parse_pointcloud2_xyzrgb(self._latest_pc)
+        xyzrgb = crop_workspace(xyzrgb, self.ws)
+        pc     = fps_numpy(xyzrgb, self.n_pts)   # (1024, 6)
 
         # Joint positions
         try:
