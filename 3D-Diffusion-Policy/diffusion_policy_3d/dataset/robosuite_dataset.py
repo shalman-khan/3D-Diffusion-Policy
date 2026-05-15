@@ -79,16 +79,19 @@ class RobosuiteDataset(BaseDataset):
         return len(self.sampler)
 
     def _augment_point_cloud(self, point_cloud):
-        # Gaussian jitter: 5mm std to prevent memorization of exact sensor readings
-        point_cloud = point_cloud + np.random.randn(*point_cloud.shape).astype(np.float32) * 0.005
-        # Random point dropout: 15% of points zeroed per timestep to simulate occlusion variation
-        T, N, _ = point_cloud.shape
-        dropout_mask = np.random.rand(T, N) < 0.15
+        T, N, C = point_cloud.shape
+        # XYZ: 10mm spatial jitter
+        point_cloud[..., :3] += np.random.randn(T, N, 3).astype(np.float32) * 0.01
+        # RGB: separate colour jitter (if present)
+        if C > 3:
+            point_cloud[..., 3:] += np.random.randn(T, N, C - 3).astype(np.float32) * 0.02
+            point_cloud[..., 3:] = np.clip(point_cloud[..., 3:], 0.0, 1.0)
+        # Random point dropout: 25% of points zeroed per timestep
+        dropout_mask = np.random.rand(T, N) < 0.25
         point_cloud[dropout_mask] = 0.0
-        # Random uniform scale: ±5% perturbation — spatial jitter on XYZ,
-        # implicit brightness variation on RGB (valid augmentation for lighting changes)
+        # Random uniform scale: ±5% on XYZ only
         scale = np.float32(np.random.uniform(0.95, 1.05))
-        point_cloud = point_cloud * scale
+        point_cloud[..., :3] *= scale
         return point_cloud
 
     def _sample_to_data(self, sample):
