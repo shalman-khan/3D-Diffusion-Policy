@@ -328,12 +328,17 @@ def main():
     parser.add_argument("--n_points", type=int, default=1024)
     parser.add_argument("--workers",  type=int, default=8,
                         help="Parallel worker processes (default: 8)")
+    parser.add_argument("--n_bags",   type=int, default=None,
+                        help="Max number of bags to convert (default: all)")
     args = parser.parse_args()
 
     z_min, z_max = load_z_filter()
 
     bag_dirs = sorted(args.bags_dir.glob("session_*"))
-    print(f"\nFound {len(bag_dirs)} bags in {args.bags_dir}")
+    if args.n_bags is not None:
+        bag_dirs = bag_dirs[:args.n_bags]
+    print(f"\nFound {len(bag_dirs)} bags in {args.bags_dir}"
+          + (f" (limited to {args.n_bags})" if args.n_bags is not None else ""))
     print(f"Workers: {args.workers}  |  FPS pre-sample: {FPS_PRESAMPLE} pts\n")
 
     if args.output.exists():
