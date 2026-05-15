@@ -1,0 +1,106 @@
+# =============================================================================
+# Real Robot DP3 Configuration
+# All topic names, paths, and parameters are configured here.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# ROS2 Topics — Observation (used during data collection and policy execution)
+# ---------------------------------------------------------------------------
+topics:
+  point_cloud:       /camera/camera/depth/color/points
+  robot1_joints:     /robot1/joint_states
+  robot2_joints:     /robot2/joint_states
+  gripper1_joints:   /gripper1/joint_states
+  gripper2_joints:   /gripper2/joint_states
+
+# ---------------------------------------------------------------------------
+# ROS2 Topics — Action (used during policy execution only)
+# Robots use JointTrajectoryController — publishes JointTrajectory with 50ms horizon
+# so the UR controller smoothly interpolates between DP3 steps instead of jerking.
+# Grippers use Float64MultiArray passthrough to your gripper driver.
+# ---------------------------------------------------------------------------
+action_topics:
+  robot1_command:    /robot1_joint_trajectory_controller/joint_trajectory
+  robot2_command:    /robot2_joint_trajectory_controller/joint_trajectory
+  gripper1_command:  /gripper1/cmd          # adjust to match your gripper driver
+  gripper2_command:  /gripper2/cmd          # adjust to match your gripper driver
+
+# ---------------------------------------------------------------------------
+# Joint Names — canonical order used for agent_pos and action vectors
+# DP3 agent_pos: [r1_pan, r1_lift, r1_elbow, r1_w1, r1_w2, r1_w3, g1, r2_pan, r2_lift, r2_elbow, r2_w1, r2_w2, r2_w3, g2]
+# ---------------------------------------------------------------------------
+joint_names:
+  robot1:
+    - robot1_shoulder_pan_joint
+    - robot1_shoulder_lift_joint
+    - robot1_elbow_joint
+    - robot1_wrist_1_joint
+    - robot1_wrist_2_joint
+    - robot1_wrist_3_joint
+  robot2:
+    - robot2_shoulder_pan_joint
+    - robot2_shoulder_lift_joint
+    - robot2_elbow_joint
+    - robot2_wrist_1_joint
+    - robot2_wrist_2_joint
+    - robot2_wrist_3_joint
+  gripper1:
+    - gripper1_finger_joint
+  gripper2:
+    - gripper2_finger_joint
+
+# ---------------------------------------------------------------------------
+# Rosbag Data — paths and trial indices
+# ---------------------------------------------------------------------------
+rosbag:
+  base_dir:       /home/rosi/Downloads/rosbag_data_dp3
+  camera_subdir:  camera              # base_dir/camera_subdir/trial{n}_camera/
+  robot_subdir:   Trajectory_Gripper  # base_dir/robot_subdir/trial{n}_robot/
+  trials:         [2, 3, 4, 5, 6, 7, 8]
+
+# ---------------------------------------------------------------------------
+# Data Processing
+# ---------------------------------------------------------------------------
+data:
+  output_zarr:    /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/real_two_arm_lift.zarr
+  target_hz:      20
+  n_points:       1024                # FPS downsample target
+  sync_tolerance_ms: 100              # max allowed time gap when syncing bags (ms)
+
+# Point cloud workspace crop (camera optical frame, metres)
+# Tune these to tightly bound your table workspace
+workspace:
+  x_min: -0.8
+  x_max:  0.8
+  y_min: -0.6
+  y_max:  0.6
+  z_min:  0.4   # must match z_filter_config.yaml used during training
+  z_max:  1.1   # must match z_filter_config.yaml used during training
+
+# Action clipping — max joint delta per step (radians) and gripper delta (normalised 0-1)
+action:
+  max_joint_delta:   0.05   # ~3 deg per step at 20Hz; tune to your teleoperation style
+  max_gripper_delta: 0.1
+
+# ---------------------------------------------------------------------------
+# Robots — IP addresses and types
+# ---------------------------------------------------------------------------
+robots:
+  robot1:
+    ip:   192.168.1.101    # ← set your UR10 IP
+    type: ur10
+    tf_prefix: robot1_
+  robot2:
+    ip:   192.168.1.102    # ← set your UR10e IP
+    type: ur10e
+    tf_prefix: robot2_
+
+# ---------------------------------------------------------------------------
+# Policy Execution
+# ---------------------------------------------------------------------------
+policy:
+  checkpoint_path:  /home/rosi/3D-Diffusion-Policy/data/outputs/real_cable_pull/checkpoints/epoch=0030-val_loss=0.018482.ckpt
+  task_config:      real_two_arm_lift
+  n_action_steps:   8     # how many actions to execute before re-querying
+  inference_steps:  3     # DDIM steps at eval time
+  obs_hz:           20    # observation polling rate

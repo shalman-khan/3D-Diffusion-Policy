@@ -46,17 +46,19 @@ class RobosuiteDataset(BaseDataset):
         self.horizon = horizon
         self.pad_before = pad_before
         self.pad_after = pad_after
+        self.augment = True
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
         val_set.sampler = SequenceSampler(
-            replay_buffer=self.replay_buffer, 
+            replay_buffer=self.replay_buffer,
             sequence_length=self.horizon,
-            pad_before=self.pad_before, 
+            pad_before=self.pad_before,
             pad_after=self.pad_after,
             episode_mask=~self.train_mask
             )
         val_set.train_mask = ~self.train_mask
+        val_set.augment = False
         return val_set
 
     def get_normalizer(self, mode='limits', **kwargs):
@@ -76,14 +78,29 @@ class RobosuiteDataset(BaseDataset):
     def __len__(self) -> int:
         return len(self.sampler)
 
+    def _augment_point_cloud(self, point_cloud):
+        # Gaussian jitter: 5mm std to prevent memorization of exact sensor readings
+        point_cloud = point_cloud + np.random.randn(*point_cloud.shape).astype(np.float32) * 0.005
+        # Random point dropout: 15% of points zeroed per timestep to simulate occlusion variation
+        T, N, _ = point_cloud.shape
+        dropout_mask = np.random.rand(T, N) < 0.15
+        point_cloud[dropout_mask] = 0.0
+        # Random uniform scale: ±5% size perturbation across whole cloud
+        scale = np.float32(np.random.uniform(0.95, 1.05))
+        point_cloud = point_cloud * scale
+        return point_cloud
+
     def _sample_to_data(self, sample):
         """
         Maps the raw sample dictionary to the format expected by the policy.
         Notice how 'state' from the Zarr is mapped to 'agent_pos'.
         """
-        agent_pos = sample['state'].astype(np.float32) 
+        agent_pos = sample['state'].astype(np.float32)
         point_cloud = sample['point_cloud'].astype(np.float32)
         action = sample['action'].astype(np.float32)
+
+        if self.augment:
+            point_cloud = self._augment_point_cloud(point_cloud)
 
         data = {
             'obs': {

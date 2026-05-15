@@ -1,0 +1,38 @@
+FROM ros:humble-ros-base
+
+# System dependencies
+RUN apt-get update && apt-get install -y \
+    python3-pip \
+    python3-dev \
+    libusb-1.0-0-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python dependencies
+RUN pip3 install --no-cache-dir \
+    ur_rtde \
+    numpy \
+    "zarr==2.17.2" \
+    PyYAML \
+    tqdm \
+    hydra-core \
+    omegaconf \
+    open3d \
+    diffusers \
+    einops \
+    termcolor \
+    dill
+
+# PyTorch — change cu118 to cu121 if your GPU needs CUDA 12
+RUN pip3 install --no-cache-dir \
+    torch torchvision \
+    --index-url https://download.pytorch.org/whl/cu118
+
+# Copy and install DP3 package
+WORKDIR /workspace
+COPY . /workspace/3D-Diffusion-Policy
+RUN pip3 install --no-cache-dir -e /workspace/3D-Diffusion-Policy
+
+# Source ROS2 on every shell
+RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc
+
+WORKDIR /workspace/3D-Diffusion-Policy

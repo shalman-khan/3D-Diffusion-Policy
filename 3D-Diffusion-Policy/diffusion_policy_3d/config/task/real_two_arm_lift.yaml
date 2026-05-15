@@ -1,0 +1,30 @@
+name: real_two_arm_lift
+
+task_name: RealTwoArmLift
+
+shape_meta: &shape_meta
+  obs:
+    point_cloud:
+      shape: [1024, 3]
+      type: point_cloud
+    agent_pos:
+      # robot1_joints(6) + gripper1(1) + robot2_joints(6) + gripper2(1) = 14
+      shape: [14]
+      type: low_dim
+  action:
+    # robot1_joint_delta(6) + gripper1_delta(1) + robot2_joint_delta(6) + gripper2_delta(1) = 14
+    shape: [14]
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.robosuite_dataset.RobosuiteDataset
+  zarr_path: /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/real_two_arm_lift.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
+
+# No sim rollouts for real robot — evaluation is done via policy_executor.py
+env_runner:
+  _target_: diffusion_policy_3d.env_runner.real_robot_runner.RealRobotRunner

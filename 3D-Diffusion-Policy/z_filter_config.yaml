@@ -1,0 +1,5 @@
+# Workspace depth filter for ZED camera (metres).
+# Points outside [z_min, z_max] are discarded before FPS downsampling.
+# Run z_filter_gui.py to tune visually for your exact scene.
+z_min: 0.4
+z_max: 0.81
