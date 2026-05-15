@@ -49,7 +49,7 @@ GRIPPER1_TOPIC = "/gripper1/joint_states"
 GRIPPER2_TOPIC = "/gripper2/joint_states"
 DEPTH_TOPIC    = "/zed/zed_node/depth/depth_registered"
 CAM_INFO_TOPIC = "/zed/zed_node/depth/camera_info"
-RGB_TOPIC      = "/zed/zed_node/rgb/image_rect_color"
+RGB_TOPIC      = "/zed/zed_node/rgb/color/rect/image"
 
 CONFIG_PATH = Path(__file__).parent / "z_filter_config.yaml"
 

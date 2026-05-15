@@ -58,7 +58,7 @@ ROBOT2_IP = "192.168.1.20"
 # Only camera topics come from ROS2 — robot/gripper state is read via RTDE
 DEPTH_TOPIC    = "/zed/zed_node/depth/depth_registered"
 CAM_INFO_TOPIC = "/zed/zed_node/depth/camera_info"
-RGB_TOPIC      = "/zed/zed_node/rgb/image_rect_color"
+RGB_TOPIC      = "/zed/zed_node/rgb/color/rect/image"
 
 N_POINTS = 1024
 
