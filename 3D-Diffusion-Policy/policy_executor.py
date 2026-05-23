@@ -165,9 +165,8 @@ class BimanualRTDE:
         self.rc2 = RTDEControl(robot2_ip)
         self.rr2 = RTDEReceive(robot2_ip)
 
-        # Gripper positions tracked locally — we send all commands so we
-        # always know the last commanded value (matches training data init:
-        # gripper1 always closed=1.0, gripper2 starts open=0.0)
+        # Gripper positions tracked in [0, 1] matching training zarr convention.
+        # Init: gripper1 closed, gripper2 open — matches typical demo start.
         self._g1_pos = 1.0
         self._g2_pos = 0.0
 
@@ -175,11 +174,11 @@ class BimanualRTDE:
 
     def get_state(self) -> np.ndarray:
         """Read 14-D state [r1(6), g1(1), r2(6), g2(1)].
-        Arm joints from RTDE; gripper positions from last commanded value."""
+        Arm joints from RTDE; gripper in [0, 1] matching training zarr convention."""
         r1 = np.array(self.rr1.getActualQ(), dtype=np.float32)   # (6,)
         r2 = np.array(self.rr2.getActualQ(), dtype=np.float32)   # (6,)
-        g1 = np.array([self._g1_pos], dtype=np.float32)          # (1,)
-        g2 = np.array([self._g2_pos], dtype=np.float32)          # (1,)
+        g1 = np.array([self._g1_pos], dtype=np.float32)          # (1,) in [0, 1]
+        g2 = np.array([self._g2_pos], dtype=np.float32)          # (1,) in [0, 1]
         return np.concatenate([r1, g1, r2, g2])                   # (14,)
 
     def get_joints(self):
@@ -192,28 +191,27 @@ class BimanualRTDE:
         self.rc1.servoJ(q1_target.tolist(), self.VEL, self.ACC, self.dt, self.LOOKAHEAD, self.GAIN)
         self.rc2.servoJ(q2_target.tolist(), self.VEL, self.ACC, self.dt, self.LOOKAHEAD, self.GAIN)
 
-    def set_gripper(self, which: int, position_01: float, min_change: float = 0.05):
+    def set_gripper(self, which: int, position_01: float, min_change: float = 0.02):
         """Send gripper command non-blocking via daemon thread.
-        Skipped if change < min_change to avoid blocking on every loop.
-        which: 1 = robot1 gripper, 2 = robot2 gripper
+        position_01: policy output in [0, 1] matching training zarr convention.
+        min_change lowered to 0.02 — diffusion outputs gradual trajectories;
+            0.05 filtered out nearly every incremental close step.
         """
         cur = self._g1_pos if which == 1 else self._g2_pos
         if abs(position_01 - cur) < min_change:
-            return   # no meaningful change — skip to avoid blocking
+            return
 
         pos_byte = int(np.clip(position_01, 0.0, 1.0) * 255)
         script = f"def set_gripper():\n  rq_set_pos({pos_byte})\nend\n"
-        rc     = self.rc1 if which == 1 else self.rc2
+        rc = self.rc1 if which == 1 else self.rc2
 
-        # Fire-and-forget — never block the control loop
         def _send():
             try:
                 rc.sendCustomScriptFunction("set_gripper", script)
             except Exception:
                 pass
 
-        t = threading.Thread(target=_send, daemon=True)
-        t.start()
+        threading.Thread(target=_send, daemon=True).start()
 
         if which == 1:
             self._g1_pos = float(np.clip(position_01, 0.0, 1.0))
@@ -386,9 +384,10 @@ def run(args):
                   f"r2={np.abs(raw_delta[7:13]).max():.4f}  "
                   f"g2={state_now[13]:.2f}→{actions[0,13]:.2f}")
 
-            # Safety clamp — only robot2 moves, robot1 locked
+            # Safety clamp — only robot2 moves, robot1 (arm + gripper) locked.
+            # 0:6 = arm joints, 6 = gripper1 — both must be frozen.
             for step_i in range(len(actions)):
-                actions[step_i, 0:6] = state_now[0:6]
+                actions[step_i, 0:7] = state_now[0:7]
                 for j in range(6):
                     idx   = 7 + j
                     delta = np.clip(actions[step_i, idx] - state_now[idx],
@@ -434,18 +433,14 @@ def run(args):
                     if wait > 0:
                         time.sleep(wait)
 
-                # Gripper commands disabled — rq_set_pos URScript conflicts
-                # with External Control program. Enable once URCap confirmed.
-                # robots.set_gripper(1, g1_target)
-                # robots.set_gripper(2, g2_target)
+                robots.set_gripper(1, g1_target)
+                robots.set_gripper(2, g2_target)
 
             # 5. Get next action (inference thread should have it ready)
             try:
                 actions = action_queue.get(timeout=0.5)
             except _queue.Empty:
                 print("[WARN] inference too slow — holding last action")
-
-            loop_count += 1
 
             loop_count += 1
 
@@ -469,8 +464,9 @@ def main():
     parser.add_argument("--robot2_ip",  default=ROBOT2_IP)
     parser.add_argument("--hz",             type=int, default=20,  help="DP3 inference rate")
     parser.add_argument("--rtde_hz",        type=int, default=125, help="RTDE servoJ rate")
-    parser.add_argument("--n_action_steps", type=int, default=2,
-                        help="Action steps per inference chunk (default 2: 2×48ms=96ms > 65ms inference → zero gap)")
+    parser.add_argument("--n_action_steps", type=int, default=8,
+                        help="Must match n_action_steps used during training (default 8). "
+                             "Lower values skip late trajectory steps (e.g. gripper close).")
     parser.add_argument("--infer_steps",    type=int,   default=5,
                         help="Diffusion denoising steps at inference (default 5, trained with 10)")
     parser.add_argument("--action_scale",  type=float, default=1.0,

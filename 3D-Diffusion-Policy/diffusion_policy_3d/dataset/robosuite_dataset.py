@@ -5,7 +5,7 @@ import copy
 from diffusion_policy_3d.common.pytorch_util import dict_apply
 from diffusion_policy_3d.common.replay_buffer import ReplayBuffer
 from diffusion_policy_3d.common.sampler import SequenceSampler, get_val_mask
-from diffusion_policy_3d.model.common.normalizer import LinearNormalizer
+from diffusion_policy_3d.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 from diffusion_policy_3d.dataset.base_dataset import BaseDataset
 
 class RobosuiteDataset(BaseDataset):
@@ -62,33 +62,60 @@ class RobosuiteDataset(BaseDataset):
         return val_set
 
     def get_normalizer(self, mode='limits', **kwargs):
-        """
-        DP3 normalizes the inputs (state and action) to [-1, 1] before passing 
-        them to the diffusion model. Point clouds are usually centered separately.
-        """
         data = {
             'action': self.replay_buffer['action'],
             'agent_pos': self.replay_buffer['state'],
-            'point_cloud': self.replay_buffer['point_cloud']  # <--- ADD THIS LINE!
         }
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
+        # Per-axis XYZ scaling (last_n_dims=1) stretches geometry (sphere → ellipsoid),
+        # confusing PointNet. PointNet's internal LayerNorm handles meter-scale natively.
+        normalizer['point_cloud'] = SingleFieldLinearNormalizer.create_identity()
         return normalizer
 
     def __len__(self) -> int:
         return len(self.sampler)
 
-    def _augment_point_cloud(self, point_cloud):
-        # Gaussian jitter: 5mm std to prevent memorization of exact sensor readings
-        point_cloud = point_cloud + np.random.randn(*point_cloud.shape).astype(np.float32) * 0.005
-        # Random point dropout: 15% of points zeroed per timestep to simulate occlusion variation
-        T, N, _ = point_cloud.shape
-        dropout_mask = np.random.rand(T, N) < 0.15
-        point_cloud[dropout_mask] = 0.0
-        # Random uniform scale: ±5% size perturbation across whole cloud
-        scale = np.float32(np.random.uniform(0.95, 1.05))
-        point_cloud = point_cloud * scale
-        return point_cloud
+    def _augment_point_cloud(self, point_cloud: np.ndarray) -> np.ndarray:
+        """
+        point_cloud: (T, N, C) where C=3 (XYZ) or C=6 (XYZRGB).
+        A single consistent transform is applied across the T observation window.
+        """
+        T, N, C = point_cloud.shape
+        result = point_cloud.copy()
+        xyz = result[..., :3]
+
+        # Gaussian jitter: 5mm std
+        xyz += np.random.randn(T, N, 3).astype(np.float32) * 0.005
+
+        # Random yaw (Z-axis) rotation — single angle for the whole T-step window.
+        # Assumes camera Z ≈ vertical (valid for downward-facing ZED).
+        theta = np.random.uniform(-np.pi, np.pi)
+        c, s = np.cos(theta), np.sin(theta)
+        R = np.array([[c, -s, 0.0],
+                      [s,  c, 0.0],
+                      [0.0, 0.0, 1.0]], dtype=np.float32)
+        xyz[:] = xyz @ R.T
+
+        # Translation jitter: 2cm — accounts for scene-to-scene position drift
+        xyz += np.random.randn(3).astype(np.float32) * 0.02
+
+        # Uniform scale: ±5%
+        xyz *= np.float32(np.random.uniform(0.95, 1.05))
+
+        # Point dropout via resampling (not zeroing).
+        # Zeroing sends dropped points to the origin → after normalization they become
+        # Z-outliers (e.g. -1.5 for typical depth range) that corrupt max-pool.
+        for t in range(T):
+            dropout_mask = np.random.rand(N) < 0.15
+            n_drop = int(dropout_mask.sum())
+            if n_drop > 0:
+                valid_idx = np.where(~dropout_mask)[0]
+                if len(valid_idx) > 0:
+                    resample_idx = np.random.choice(valid_idx, size=n_drop, replace=True)
+                    result[t, dropout_mask] = result[t, resample_idx]
+
+        return result
 
     def _sample_to_data(self, sample):
         """

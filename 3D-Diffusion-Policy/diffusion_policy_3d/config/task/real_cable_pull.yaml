@@ -5,7 +5,7 @@ task_name: RealCablePull
 shape_meta: &shape_meta
   obs:
     point_cloud:
-      shape: [1024, 3]
+      shape: [1024, 6]   # XYZRGB — zarr stores 6 channels; use_pc_color controls whether RGB is used
       type: point_cloud
     agent_pos:
       # robot1_joints(6) + gripper1(1) + robot2_joints(6) + gripper2(1) = 14
@@ -17,7 +17,7 @@ shape_meta: &shape_meta
 
 dataset:
   _target_: diffusion_policy_3d.dataset.robosuite_dataset.RobosuiteDataset
-  zarr_path: /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/real_cable_pull_trimmed.zarr
+  zarr_path: /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/rgb_real_cable_pull_trimmed_clean.zarr
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}

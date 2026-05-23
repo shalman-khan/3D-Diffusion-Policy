@@ -266,11 +266,14 @@ class TrainDP3Workspace:
             if (self.epoch % cfg.training.val_every) == 0 and RUN_VALIDATION:
                 with torch.no_grad():
                     val_losses = list()
-                    with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
+                    with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}",
                             leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                         for batch_idx, batch in enumerate(tepoch):
                             batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                            loss, loss_dict = self.model.compute_loss(batch)
+                            # Use EMA model (policy) — it is what gets saved and deployed.
+                            # Non-EMA model overfits faster; tracking it gives a misleading
+                            # early-stopping signal and discards good EMA checkpoints.
+                            loss, loss_dict = policy.compute_loss(batch)
                             val_losses.append(loss)
                             if (cfg.training.max_val_steps is not None) \
                                 and batch_idx >= (cfg.training.max_val_steps-1):

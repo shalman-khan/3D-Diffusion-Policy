@@ -61,11 +61,10 @@ class RealDexDataset(BaseDataset):
         data = {
             'action': self.replay_buffer['action'],
             'agent_pos': self.replay_buffer['state'][...,:],
-            'point_cloud': self.replay_buffer['point_cloud'],
         }
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
-        # normalizer['point_cloud'] = SingleFieldLinearNormalizer.create_identity()
+        normalizer['point_cloud'] = SingleFieldLinearNormalizer.create_identity()
         return normalizer
 
     def __len__(self) -> int:
