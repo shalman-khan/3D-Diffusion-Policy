@@ -7,6 +7,16 @@ task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "debug"
 
+# Number of points fed to the PointNet encoder.
+# The zarr must be stored at >= this value (real_config.yaml data.n_points).
+# Override on the command line: n_points=1024 / 2048 / 4096 / 8192
+# Recommended batch_size per n_points (RTX 4090):
+#   512–1024  → batch_size: 128
+#   2048      → batch_size: 64
+#   4096      → batch_size: 32   (default)
+#   8192      → batch_size: 16
+n_points: 4096
+
 # horizon: 4
 horizon: 16
 n_obs_steps: 2
@@ -77,14 +87,14 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 128
+  batch_size: 32   # for n_points=4096; increase to 128 if using n_points<=1024
   num_workers: 8
   shuffle: True
   pin_memory: True
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 128
+  batch_size: 32   # match dataloader batch_size
   num_workers: 8
   shuffle: False
   pin_memory: True

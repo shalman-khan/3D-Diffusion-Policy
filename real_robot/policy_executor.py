@@ -69,7 +69,7 @@ def extract_joint_positions(msg, joint_names: list) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def load_policy(checkpoint_path: str, inference_steps: int):
-    """Load DP3 policy from checkpoint."""
+    """Load DP3 policy from checkpoint, returning (policy, device, n_points)."""
     import hydra
     from omegaconf import OmegaConf
     import pathlib
@@ -89,7 +89,30 @@ def load_policy(checkpoint_path: str, inference_steps: int):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     policy.to(device)
     policy.eval()
-    return policy, device
+
+    # Read n_points from checkpoint so inference matches training exactly
+    n_points = _read_n_points_from_cfg(cfg)
+    return policy, device, n_points
+
+
+def _read_n_points_from_cfg(cfg) -> int:
+    """Extract training n_points from a checkpoint config, with fallbacks."""
+    from omegaconf import OmegaConf
+    try:
+        val = OmegaConf.select(cfg, "n_points")
+        if val is not None:
+            return int(val)
+    except Exception:
+        pass
+    try:
+        return int(cfg.task.shape_meta.obs.point_cloud.shape[0])
+    except Exception:
+        pass
+    try:
+        return int(cfg.shape_meta.obs.point_cloud.shape[0])
+    except Exception:
+        pass
+    return 1024   # safe fallback for old checkpoints
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +121,7 @@ def load_policy(checkpoint_path: str, inference_steps: int):
 
 class PolicyExecutorNode(Node):
 
-    def __init__(self, cfg: dict, policy, device: torch.device):
+    def __init__(self, cfg: dict, policy, device: torch.device, n_points: int):
         super().__init__("dp3_policy_executor")
         self.cfg = cfg
         self.policy = policy
@@ -115,9 +138,12 @@ class PolicyExecutorNode(Node):
         self.n_action_steps = cfg["policy"]["n_action_steps"]
 
         self.ws = cfg["workspace"]
-        self.n_pts = cfg["data"]["n_points"]
+        # n_pts comes from the checkpoint (training n_points), NOT from real_config.yaml
+        # real_config.yaml data.n_points controls zarr conversion resolution only
+        self.n_pts = n_points
         self.max_jd = cfg["action"]["max_joint_delta"]
         self.max_gd = cfg["action"]["max_gripper_delta"]
+        self.get_logger().info(f"Inference n_points={self.n_pts}")
 
         # Observation buffers (deque of length n_obs_steps)
         self.pc_buffer    = deque(maxlen=self.n_obs_steps)
@@ -337,11 +363,11 @@ def main():
     inference_steps = cfg["policy"]["inference_steps"]
 
     print(f"Loading policy from: {ckpt}")
-    policy, device = load_policy(ckpt, inference_steps)
-    print(f"Policy loaded on {device}")
+    policy, device, n_points = load_policy(ckpt, inference_steps)
+    print(f"Policy loaded on {device}  |  n_points={n_points}")
 
     rclpy.init()
-    node = PolicyExecutorNode(cfg, policy, device)
+    node = PolicyExecutorNode(cfg, policy, device, n_points)
 
     try:
         rclpy.spin(node)

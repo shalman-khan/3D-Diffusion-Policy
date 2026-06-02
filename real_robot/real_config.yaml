@@ -117,7 +117,8 @@ rosbag:
 data:
   output_zarr:    /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/real_cable_pull_28may.zarr
   target_hz:      20
-  n_points:       1024                # FPS downsample target
+  n_points:       8192                # FPS downsample target stored in zarr (max resolution)
+                                    # dataset downsamples to task n_points at load time
   sync_tolerance_ms: 100              # max allowed time gap when syncing bags (ms)
 
 # Point cloud workspace crop (camera optical frame, metres)

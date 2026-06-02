@@ -60,8 +60,6 @@ DEPTH_TOPIC    = "/zed/zed_node/depth/depth_registered"
 CAM_INFO_TOPIC = "/zed/zed_node/depth/camera_info"
 RGB_TOPIC      = "/zed/zed_node/rgb/color/rect/image"
 
-N_POINTS = 1024
-
 # ── point cloud helpers ───────────────────────────────────────────────────────
 
 def load_z_filter():
@@ -75,7 +73,7 @@ def load_z_filter():
 
 def depth_to_pointcloud(depth_msg: Image, cam_msg: CameraInfo, rgb_msg: Image,
                          z_min: float, z_max: float,
-                         n_points: int = N_POINTS) -> np.ndarray:
+                         n_points: int = 1024) -> np.ndarray:
     """Reconstruct XYZRGB point cloud from depth + RGB + camera_info, matching training pipeline."""
     h, w = depth_msg.height, depth_msg.width
     depth = np.frombuffer(bytes(depth_msg.data), dtype=np.float32).reshape(h, w)
@@ -113,33 +111,93 @@ def depth_to_pointcloud(depth_msg: Image, cam_msg: CameraInfo, rgb_msg: Image,
     return fps_or_pad(pts_rgb, n_points)
 
 
-FPS_PRESAMPLE = 8192   # random pre-subsample before FPS — keeps each frame <0.1s
+# GPU FPS via pytorch3d — used in obs_worker thread via a dedicated CUDA stream
+# so it doesn't serialize with the inference_worker's default stream.
+try:
+    import pytorch3d.ops as _p3d_ops
+    _HAVE_P3D = True
+except ImportError:
+    _HAVE_P3D = False
+
+_obs_cuda_stream = None   # lazily created on first GPU call
 
 
 def fps_or_pad(pts: np.ndarray, n: int) -> np.ndarray:
+    """
+    Downsample pts (N, C) to (n, C) via FPS, or pad if N < n.
+
+    Preferred path: pytorch3d GPU FPS on a dedicated CUDA stream (~2–10 ms).
+    Fallback:       random pre-subsample to max(n, 8192) then CPU numpy FPS.
+    """
+    global _obs_cuda_stream
     n_features = pts.shape[1]
+
     if len(pts) == 0:
         return np.zeros((n, n_features), dtype=np.float32)
     if len(pts) <= n:
         pad = np.zeros((n - len(pts), n_features), dtype=np.float32)
         return np.vstack([pts, pad]).astype(np.float32)
-    # Random pre-subsample so FPS runs on at most FPS_PRESAMPLE points
-    if len(pts) > FPS_PRESAMPLE:
-        idx_pre = np.random.choice(len(pts), FPS_PRESAMPLE, replace=False)
+
+    # ── GPU path ──────────────────────────────────────────────────────────────
+    if _HAVE_P3D and torch.cuda.is_available():
+        if _obs_cuda_stream is None:
+            _obs_cuda_stream = torch.cuda.Stream()
+        # Random pre-subsample to keep GPU transfer small (max 2× n or 16384)
+        n_pre = min(len(pts), max(n * 2, 16384))
+        if len(pts) > n_pre:
+            idx_pre = np.random.choice(len(pts), n_pre, replace=False)
+            pts_pre = pts[idx_pre]
+        else:
+            pts_pre = pts
+        with torch.cuda.stream(_obs_cuda_stream):
+            pts_t = torch.from_numpy(pts_pre).float().unsqueeze(0).cuda()
+            _, sampled_idx = _p3d_ops.sample_farthest_points(pts_t[..., :3], K=n)
+            result = pts_t[0, sampled_idx[0]].cpu().numpy()
+        _obs_cuda_stream.synchronize()
+        return result.astype(np.float32)
+
+    # ── CPU fallback: random pre-subsample → numpy FPS ────────────────────────
+    n_pre = min(len(pts), max(n, 8192))
+    if len(pts) > n_pre:
+        idx_pre = np.random.choice(len(pts), n_pre, replace=False)
         pts = pts[idx_pre]
-    if len(pts) <= n:
-        pad = np.zeros((n - len(pts), n_features), dtype=np.float32)
-        return np.vstack([pts, pad]).astype(np.float32)
-    xyz  = pts[:, :3]   # use only XYZ for spatial distances
-    idx  = np.zeros(n, dtype=np.int64)
+    xyz   = pts[:, :3]
+    idx   = np.zeros(n, dtype=np.int64)
     dists = np.full(len(pts), np.inf)
-    cur  = 0
+    cur   = 0
     for i in range(n):
         idx[i] = cur
         d = np.sum((xyz - xyz[cur]) ** 2, axis=1)
         dists = np.minimum(dists, d)
         cur = int(np.argmax(dists))
     return pts[idx].astype(np.float32)
+
+
+def _read_n_points_from_cfg(cfg) -> int:
+    """
+    Extract the training n_points from a checkpoint config.
+    Tries cfg.n_points first (new checkpoints), then falls back to reading the
+    stored point_cloud shape from shape_meta (any checkpoint).
+    Returns 1024 if neither is present (old checkpoint compatibility).
+    """
+    from omegaconf import OmegaConf
+    try:
+        val = OmegaConf.select(cfg, "n_points")
+        if val is not None:
+            return int(val)
+    except Exception:
+        pass
+    try:
+        shape = cfg.task.shape_meta.obs.point_cloud.shape
+        return int(shape[0])
+    except Exception:
+        pass
+    try:
+        shape = cfg.shape_meta.obs.point_cloud.shape
+        return int(shape[0])
+    except Exception:
+        pass
+    return 1024   # safe fallback for checkpoints predating this change
 
 
 # ── ROS2 sensor node ──────────────────────────────────────────────────────────
@@ -305,7 +363,10 @@ def run(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     policy.to(device)
-    print(f"Policy loaded on {device}")
+
+    # Read n_points from the checkpoint so inference matches training exactly
+    n_points = _read_n_points_from_cfg(cfg)
+    print(f"Policy loaded on {device}  |  n_points={n_points}")
 
     z_min, z_max = load_z_filter()
 
@@ -331,7 +392,7 @@ def run(args):
         print(f"Inference steps: {args.infer_steps}")
 
     # ── Warm up GPU ───────────────────────────────────────────────────────────
-    dummy_pc  = torch.zeros(1, 2, N_POINTS, 6).to(device)
+    dummy_pc  = torch.zeros(1, 2, n_points, 6).to(device)
     dummy_pos = torch.zeros(1, 2, 14).to(device)
     for _ in range(3):
         t_w = time.time()
@@ -352,7 +413,8 @@ def run(args):
         interval = 1.0 / args.hz   # 50ms
         while not stop_obs.is_set():
             t0 = time.time()
-            pc    = depth_to_pointcloud(camera.depth_msg, camera.cam_info_msg, camera.rgb_msg, z_min, z_max)
+            pc    = depth_to_pointcloud(camera.depth_msg, camera.cam_info_msg,
+                                        camera.rgb_msg, z_min, z_max, n_points)
             state = robots.get_state()
             with obs_lock:
                 obs_ring.append((pc, state))
