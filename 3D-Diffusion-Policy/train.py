@@ -177,6 +177,8 @@ class TrainDP3Workspace:
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
+        _best_val      = float('inf')
+        _no_improve    = 0
         for local_epoch_idx in range(cfg.training.num_epochs):
             step_log = dict()
             # ========= train for this epoch ==========
@@ -327,6 +329,46 @@ class TrainDP3Workspace:
             policy.train()
 
             # end of epoch
+            # ── per-epoch overfitting monitor ─────────────────────────────────
+            _tl    = step_log.get('train_loss', float('nan'))
+            _vl    = step_log.get('val_loss',   float('nan'))
+            _lr    = step_log.get('lr',         float('nan'))
+            _ratio = (_vl / _tl) if (_tl > 1e-9 and not np.isnan(_vl)) else float('nan')
+
+            # Track best val and how long since it improved
+            if not np.isnan(_vl):
+                if _vl < _best_val - 1e-6:
+                    _best_val   = _vl
+                    _no_improve = 0
+                else:
+                    _no_improve += 1
+
+            ratio_str = f"{_ratio:.3f}" if not np.isnan(_ratio) else "  N/A "
+            flag = ""
+            if not np.isnan(_ratio):
+                if _ratio > 2.0:
+                    flag = "  *** OVERFIT — val>2x train ***"
+                elif _ratio > 1.5:
+                    flag = "  ** overfitting (val>1.5x train)"
+                elif _ratio > 1.2:
+                    flag = "  * watch (val>1.2x train)"
+            if _no_improve >= 100:
+                flag += f"  [NO IMPROVE {_no_improve} ep — consider stopping]"
+            elif _no_improve >= 50:
+                flag += f"  [no improve {_no_improve} ep]"
+
+            print(
+                f"[Epoch {self.epoch:>4d}/{cfg.training.num_epochs}]"
+                f"  train={_tl:.5f}"
+                f"  val={_vl:.5f}"
+                f"  ratio(v/t)={ratio_str}"
+                f"  best_val={_best_val:.5f}"
+                f"  no_improve={_no_improve:>3d}"
+                f"  lr={_lr:.2e}"
+                f"{flag}"
+            )
+            # ──────────────────────────────────────────────────────────────────
+
             # log of last step is combined with validation and rollout
             wandb_run.log(step_log, step=self.global_step)
             self.global_step += 1

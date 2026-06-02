@@ -17,7 +17,7 @@ shape_meta: &shape_meta
 
 dataset:
   _target_: diffusion_policy_3d.dataset.robosuite_dataset.RobosuiteDataset
-  zarr_path: /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/rgb_real_cable_pull_trimmed.zarr
+  zarr_path: /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/real_cable_pull_28may.zarr
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}

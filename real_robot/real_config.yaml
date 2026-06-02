@@ -5,9 +5,12 @@
 
 # ---------------------------------------------------------------------------
 # ROS2 Topics — Observation (used during data collection and policy execution)
+# ZED combined bags use depth+rgb images; robot/gripper topics are unchanged.
 # ---------------------------------------------------------------------------
 topics:
-  point_cloud:       /camera/camera/depth/color/points
+  depth:             /zed/zed_node/depth/depth_registered
+  cam_info:          /zed/zed_node/depth/camera_info
+  rgb:               /zed/zed_node/rgb/color/rect/image
   robot1_joints:     /robot1/joint_states
   robot2_joints:     /robot2/joint_states
   gripper1_joints:   /gripper1/joint_states
@@ -50,19 +53,69 @@ joint_names:
     - gripper2_finger_joint
 
 # ---------------------------------------------------------------------------
-# Rosbag Data — paths and trial indices
+# Rosbag Data — 28May combined ZED sessions
+# Each session is a self-contained bag folder under base_dir containing
+# all ZED + robot/gripper topics.  Add or remove sessions as needed.
 # ---------------------------------------------------------------------------
 rosbag:
-  base_dir:       /home/rosi/Downloads/rosbag_data_dp3
-  camera_subdir:  camera              # base_dir/camera_subdir/trial{n}_camera/
-  robot_subdir:   Trajectory_Gripper  # base_dir/robot_subdir/trial{n}_robot/
-  trials:         [2, 3, 4, 5, 6, 7, 8]
+  base_dir: "/media/rosi/T7 Shield/28May"
+  sessions:
+    - session_20260528_060225_filtered
+    - session_20260528_060451_filtered
+    - session_20260528_060902_filtered
+    - session_20260528_061015_filtered
+    - session_20260528_064900_filtered
+    - session_20260528_064945_filtered
+    - session_20260528_065149_filtered
+    - session_20260528_065533_filtered
+    - session_20260528_065630_filtered
+    - session_20260528_070100_filtered
+    - session_20260528_070147_filtered
+    - session_20260528_070327_filtered
+    - session_20260528_070506_filtered
+    - session_20260528_071756_filtered
+    - session_20260528_071849_filtered
+    - session_20260528_071947_filtered
+    - session_20260528_072028_filtered
+    - session_20260528_072110_filtered
+    - session_20260528_072202_filtered
+    - session_20260528_072258_filtered
+    - session_20260528_072334_filtered
+    - session_20260528_072438_filtered
+    - session_20260528_072530_filtered
+    - session_20260528_072617_filtered
+    - session_20260528_072728_filtered
+    - session_20260528_072832_filtered
+    - session_20260528_072911_filtered
+    - session_20260528_072949_filtered
+    - session_20260528_073032_filtered
+    - session_20260528_073114_filtered
+    - session_20260528_073346_filtered
+    - session_20260528_073430_filtered
+    - session_20260528_073743_filtered
+    - session_20260528_074107_filtered
+    - session_20260528_074646_filtered
+    - session_20260528_074724_filtered
+    - session_20260528_074817_filtered
+    - session_20260528_074946_filtered
+    - session_20260528_075027_filtered
+    - session_20260528_075113_filtered
+    - session_20260528_075153_filtered
+    - session_20260528_075258_filtered
+    - session_20260528_075433_filtered
+    - session_20260528_075507_filtered
+    - session_20260528_075543_filtered
+    - session_20260528_091346_filtered
+    - session_20260528_092514_filtered
+    - session_20260528_093016_filtered
+    - session_20260528_094247_filtered
+    - session_20260528_100639_filtered
 
 # ---------------------------------------------------------------------------
 # Data Processing
 # ---------------------------------------------------------------------------
 data:
-  output_zarr:    /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/real_two_arm_lift.zarr
+  output_zarr:    /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/real_cable_pull_28may.zarr
   target_hz:      20
   n_points:       1024                # FPS downsample target
   sync_tolerance_ms: 100              # max allowed time gap when syncing bags (ms)

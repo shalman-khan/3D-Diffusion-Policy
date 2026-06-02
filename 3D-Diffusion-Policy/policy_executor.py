@@ -429,6 +429,13 @@ def run(args):
                   f"r2={np.abs(raw_delta[7:13]).max():.4f}  "
                   f"g2={state_now[13]:.2f}→{actions[0,13]:.2f}")
 
+            # Seed gripper absolute positions from current state before walking through
+            # the action chunk. Each step propagates the position forward so the
+            # full chunk produces monotonically advancing gripper targets, preventing
+            # the min_change deadband in set_gripper() from gating all but the first step.
+            g1_abs = float(state_now[6])
+            g2_abs = float(state_now[13])
+
             for step_i in range(len(actions)):
                 if args.lock_robot1:
                     # Freeze robot1 — use for single-arm testing
@@ -448,6 +455,17 @@ def run(args):
                     target = state_now[idx] + delta * args.action_scale
                     actions[step_i, idx] = np.clip(
                         target, R2_MIN[j] - MARGIN, R2_MAX[j] + MARGIN)
+
+                # Grippers: the policy outputs joint deltas (same space as training data).
+                # Accumulate each step's predicted delta onto the running absolute position
+                # so the execution loop receives absolute [0,1] targets, not raw deltas.
+                g1_d   = np.clip(float(actions[step_i, 6]),  -args.max_step, args.max_step)
+                g1_abs = float(np.clip(g1_abs + g1_d, 0.0, 1.0))
+                actions[step_i, 6] = g1_abs
+
+                g2_d   = np.clip(float(actions[step_i, 13]), -args.max_step, args.max_step)
+                g2_abs = float(np.clip(g2_abs + g2_d, 0.0, 1.0))
+                actions[step_i, 13] = g2_abs
 
             try:
                 action_queue.put(actions, timeout=0.1)
