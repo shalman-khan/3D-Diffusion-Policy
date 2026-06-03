@@ -31,6 +31,9 @@ Usage:
 
 import argparse
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +45,100 @@ from numcodecs import Blosc
 import rosbag2_py
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
+
+# ---------------------------------------------------------------------------
+# GPU FPS (pytorch3d) — thread-safe via per-thread CUDA streams
+# Falls back to per-frame CPU FPS if pytorch3d / CUDA not available.
+# ---------------------------------------------------------------------------
+try:
+    from pytorch3d.ops import sample_farthest_points as _p3d_sfp
+    import torch as _torch
+    _HAVE_GPU_FPS = _torch.cuda.is_available()
+    if _HAVE_GPU_FPS:
+        print("[converter] pytorch3d GPU FPS available — fast mode enabled.")
+    else:
+        print("[converter] pytorch3d found but no CUDA — using CPU FPS.")
+except ImportError:
+    _HAVE_GPU_FPS = False
+    print("[converter] pytorch3d not found — using CPU FPS (slow for n_points>=4096).")
+
+_tls = threading.local()   # per-thread CUDA stream
+
+
+def _fps_batch(crops: list, n_pts: int) -> list:
+    """
+    Batch FPS for a list of variable-size (N_i, C) numpy arrays.
+
+    GPU path  — all frames in one pytorch3d CUDA call (~2 s for 200 frames).
+    CPU path  — per-frame fps_numpy fallback.
+    Thread-safe: each thread gets its own CUDA stream via _tls.
+
+    n_pre (pre-subsample budget) scales with n_pts so coverage is always ≥2×:
+      n_pts  512 → n_pre  8192  (16× margin)
+      n_pts 1024 → n_pre  8192  ( 8× margin)
+      n_pts 2048 → n_pre  8192  ( 4× margin)
+      n_pts 4096 → n_pre  8192  ( 2× margin)
+      n_pts 8192 → n_pre 16384  ( 2× margin)
+    """
+    if not crops:
+        return []
+
+    C     = crops[0].shape[1]
+    n_pre = min(max(n_pts * 2, 8192), 32768)
+
+    if not _HAVE_GPU_FPS:
+        return [fps_numpy(c, n_pts) for c in crops]
+
+    # Initialise per-thread CUDA stream on first use
+    if not hasattr(_tls, 'stream'):
+        _tls.stream = _torch.cuda.Stream()
+
+    results       = [None] * len(crops)
+    batch_i       = []
+    batch_pts_np  = []
+    batch_lens    = []
+
+    for i, crop in enumerate(crops):
+        n = len(crop)
+        if n == 0 or n <= n_pts:
+            # Edge case: too few points — CPU pad (rare)
+            results[i] = fps_numpy(crop, n_pts)
+            continue
+
+        # Random pre-subsample to n_pre
+        if n > n_pre:
+            idx = np.random.choice(n, n_pre, replace=False)
+            pre = crop[idx].astype(np.float32)
+        else:
+            pre = crop.astype(np.float32)
+
+        real_len = len(pre)
+        # Pad to n_pre so all frames have the same shape in the GPU batch
+        if real_len < n_pre:
+            pad = np.zeros((n_pre - real_len, C), dtype=np.float32)
+            pre = np.vstack([pre, pad])
+
+        batch_i.append(i)
+        batch_pts_np.append(pre)
+        batch_lens.append(real_len)
+
+    if batch_pts_np:
+        pts_np = np.stack(batch_pts_np)          # (B, n_pre, C)
+        with _torch.cuda.stream(_tls.stream):
+            pts_t  = _torch.from_numpy(pts_np).cuda()
+            lens_t = _torch.tensor(batch_lens, dtype=_torch.int64).cuda()
+            # FPS on XYZ only; returns (B, n_pts) indices
+            _, idx_t = _p3d_sfp(pts_t[..., :3], lengths=lens_t, K=n_pts)
+            # Gather all C channels
+            sampled = pts_t.gather(
+                1, idx_t.unsqueeze(-1).expand(-1, -1, C)
+            ).cpu().numpy()                       # (B, n_pts, C)
+        _tls.stream.synchronize()
+
+        for j, orig_i in enumerate(batch_i):
+            results[orig_i] = sampled[j]
+
+    return results
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -309,9 +406,10 @@ def process_session(session_dir: Path, cfg: dict,
     # Use the most recent camera_info (intrinsics don't change mid-session)
     cam_info_msg = caminfo_msgs[-1][1]
 
-    point_clouds   = []
+    raw_crops      = []   # (N_i, 6) after z-filter + workspace crop, before FPS
     agent_pos_list = []
 
+    t_cpu = time.time()
     print(f"[{label}] Processing {len(timeline)} frames at {cfg['data']['target_hz']}Hz ...")
 
     for ts in timeline:
@@ -325,27 +423,34 @@ def process_session(session_dir: Path, cfg: dict,
         if depth_msg is None or rgb_msg is None or r1_msg is None or r2_msg is None:
             continue
 
-        # Build XYZRGB point cloud from depth + cam_info + RGB, then crop + FPS
+        # Reconstruct + crop (no FPS yet — collected for batch GPU FPS below)
         xyzrgb = depth_to_pointcloud_xyzrgb(depth_msg, cam_info_msg, rgb_msg, z_min, z_max)
         xyzrgb = crop_workspace(xyzrgb, ws)
-        pc     = fps_numpy(xyzrgb, n_pts)   # (1024, 6)
+        raw_crops.append(xyzrgb)
 
         # Joint positions in canonical order
         r1_pos = extract_joint_positions(r1_msg, jn["robot1"])
         r2_pos = extract_joint_positions(r2_msg, jn["robot2"])
         g1_pos = np.array([g1_msg.position[0]], dtype=np.float32) if g1_msg else np.zeros(1, dtype=np.float32)
         g2_pos = np.array([g2_msg.position[0]], dtype=np.float32) if g2_msg else np.zeros(1, dtype=np.float32)
+        agent_pos_list.append(np.concatenate([r1_pos, g1_pos, r2_pos, g2_pos]))
 
-        ap = np.concatenate([r1_pos, g1_pos, r2_pos, g2_pos])   # (14,)
-        point_clouds.append(pc)
-        agent_pos_list.append(ap)
-
-    if len(point_clouds) < 10:
-        print(f"[{label}] SKIP — only {len(point_clouds)} valid frames")
+    if len(raw_crops) < 10:
+        print(f"[{label}] SKIP — only {len(raw_crops)} valid frames")
         return None, None, None
 
-    point_clouds = np.stack(point_clouds, axis=0).astype(np.float32)   # (T, 1024, 6)
-    agent_pos    = np.stack(agent_pos_list, axis=0).astype(np.float32)  # (T, 14)
+    cpu_ms = (time.time() - t_cpu) * 1000
+
+    # Batch GPU FPS for all frames in this session at once
+    t_fps = time.time()
+    pc_list = _fps_batch(raw_crops, n_pts)
+    fps_ms  = (time.time() - t_fps) * 1000
+    fps_tag = "GPU" if _HAVE_GPU_FPS else "CPU"
+    print(f"[{label}]  cpu={cpu_ms:.0f}ms  fps({fps_tag})={fps_ms:.0f}ms  "
+          f"({len(raw_crops)} frames × {n_pts} pts)")
+
+    point_clouds = np.stack(pc_list,           axis=0).astype(np.float32)   # (T, n_pts, 6)
+    agent_pos    = np.stack(agent_pos_list,    axis=0).astype(np.float32)  # (T, 14)
 
     actions = np.diff(agent_pos, axis=0)
     actions = np.concatenate([actions, actions[[-1]]], axis=0)   # (T, 14)
@@ -408,7 +513,12 @@ def write_zarr(zarr_path: str, episodes: list):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=str(Path(__file__).parent / "real_config.yaml"))
+    parser.add_argument("--config",  default=str(Path(__file__).parent / "real_config.yaml"))
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel session workers (default 1). "
+                             "2–4 recommended when GPU FPS is available. "
+                             "Each worker reads its bag and runs GPU FPS concurrently "
+                             "via separate per-thread CUDA streams.")
     args = parser.parse_args()
 
     cfg      = load_config(args.config)
@@ -417,16 +527,41 @@ def main():
 
     z_min, z_max = load_z_filter()
     print(f"Z-filter: z_min={z_min}  z_max={z_max}")
+    print(f"Workers:  {args.workers}  |  GPU FPS: {_HAVE_GPU_FPS}\n")
 
+    # Build list of valid session paths
+    session_dirs = []
+    for sname in sessions:
+        sd = base_dir / sname
+        if sd.exists():
+            session_dirs.append(sd)
+        else:
+            print(f"[SKIP] {sd} not found")
+
+    t_total = time.time()
     episodes = []
-    for session_name in sessions:
-        session_dir = base_dir / session_name
-        if not session_dir.exists():
-            print(f"[SKIP] {session_dir} not found")
-            continue
+    lock     = threading.Lock()
+
+    def _run_session(session_dir):
         pc, state, action = process_session(session_dir, cfg, z_min, z_max)
         if pc is not None:
-            episodes.append((pc, state, action))
+            with lock:
+                episodes.append((pc, state, action))
+
+    if args.workers <= 1:
+        for sd in session_dirs:
+            _run_session(sd)
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(_run_session, sd): sd.name for sd in session_dirs}
+            for fut in as_completed(futures):
+                exc = fut.exception()
+                if exc:
+                    print(f"[ERROR] {futures[fut]}: {exc}")
+
+    elapsed = time.time() - t_total
+    print(f"\nAll sessions done in {elapsed:.0f}s  ({elapsed/60:.1f} min)  "
+          f"— {len(episodes)} valid episodes")
 
     if not episodes:
         print("ERROR: no valid episodes processed. Check config paths and workspace bounds.")
