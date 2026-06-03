@@ -472,7 +472,7 @@ def write_zarr(zarr_path: str, episodes: list):
     episodes: list of (point_clouds, agent_pos, actions) tuples
     Zarr structure:
       data/
-        point_cloud   (total_steps, 1024, 6)  — XYZRGB, RGB normalised [0,1]
+        point_cloud   (total_steps, n_pts, 6)  — XYZRGB, RGB normalised [0,1]
         state         (total_steps, 14)
         action        (total_steps, 14)
       meta/
@@ -482,10 +482,11 @@ def write_zarr(zarr_path: str, episodes: list):
     store = zarr.open(zarr_path, mode="w")
 
     total_steps = sum(len(pc) for pc, _, _ in episodes)
-    n_ep = len(episodes)
-    n_features = episodes[0][0].shape[-1]  # 6 for XYZRGB
+    n_ep        = len(episodes)
+    n_pts_stored = episodes[0][0].shape[1]   # read from actual data, not hardcoded
+    n_features   = episodes[0][0].shape[2]   # 6 for XYZRGB
 
-    pc_arr  = store.zeros("data/point_cloud", shape=(total_steps, 1024, n_features), dtype="f4", chunks=(1, 1024, n_features), compressor=compressor)
+    pc_arr  = store.zeros("data/point_cloud", shape=(total_steps, n_pts_stored, n_features), dtype="f4", chunks=(1, n_pts_stored, n_features), compressor=compressor)
     st_arr  = store.zeros("data/state",       shape=(total_steps, 14),      dtype="f4", chunks=(1, 14),      compressor=compressor)
     ac_arr  = store.zeros("data/action",      shape=(total_steps, 14),      dtype="f4", chunks=(1, 14),      compressor=compressor)
     ep_ends = store.zeros("meta/episode_ends", shape=(n_ep,), dtype="i8")
