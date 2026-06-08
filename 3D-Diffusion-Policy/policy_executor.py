@@ -485,42 +485,40 @@ def run(args):
             actions  = result["action"].squeeze(0).cpu().numpy()
 
             vel       = np.abs(obs_b[1] - obs_a[1]).max()
-            raw_delta = actions[0] - state_now
+            # actions are delta outputs (training: np.diff(agent_pos))
+            raw_delta = actions[0].copy()
             print(f"  infer={infer_ms:4.0f}ms  vel={vel:.4f}  "
-                  f"r1={np.abs(raw_delta[0:6]).max():.4f}  "
-                  f"r2={np.abs(raw_delta[7:13]).max():.4f}  "
-                  f"g2={state_now[13]:.2f}→{actions[0,13]:.2f}")
+                  f"r1_Δmax={np.abs(raw_delta[0:6]).max():.4f}  "
+                  f"r2_Δmax={np.abs(raw_delta[7:13]).max():.4f}  "
+                  f"g1_Δ={raw_delta[6]:.3f}  g2_Δ={raw_delta[13]:.3f}")
 
-            # Seed gripper absolute positions from current state before walking through
-            # the action chunk. Each step propagates the position forward so the
-            # full chunk produces monotonically advancing gripper targets, preventing
-            # the min_change deadband in set_gripper() from gating all but the first step.
-            g1_abs = float(state_now[6])
-            g2_abs = float(state_now[13])
+            # Seed running absolute positions from current state.
+            # Arms use rolling q1_base/q2_base so each step's delta integrates onto
+            # the previous step's target — matching how training deltas were computed:
+            #   action[k] = state[t+k+1] - state[t+k]  (relative to previous step)
+            # Grippers use g1_abs/g2_abs for the same reason.
+            g1_abs  = float(state_now[6])
+            g2_abs  = float(state_now[13])
+            q1_base = state_now[0:6].copy().astype(np.float64)
+            q2_base = state_now[7:13].copy().astype(np.float64)
 
             for step_i in range(len(actions)):
                 if args.lock_robot1:
-                    # Freeze robot1 — use for single-arm testing
                     actions[step_i, 0:6] = state_now[0:6]
                 else:
-                    # Robot1: delta clamp only (add hard joint limits here once known)
                     for j in range(6):
-                        delta = np.clip(actions[step_i, j] - state_now[j],
-                                        -args.max_step, args.max_step)
-                        actions[step_i, j] = state_now[j] + delta * args.action_scale
+                        d = np.clip(float(actions[step_i, j]), -args.max_step, args.max_step)
+                        actions[step_i, j] = q1_base[j] + d * args.action_scale
+                    q1_base = actions[step_i, 0:6].astype(np.float64)
 
-                # Robot2: delta clamp + hard joint bounds from recorded workspace
                 for j in range(6):
-                    idx   = 7 + j
-                    delta = np.clip(actions[step_i, idx] - state_now[idx],
-                                    -args.max_step, args.max_step)
-                    target = state_now[idx] + delta * args.action_scale
+                    idx = 7 + j
+                    d = np.clip(float(actions[step_i, idx]), -args.max_step, args.max_step)
+                    target = q2_base[j] + d * args.action_scale
                     actions[step_i, idx] = np.clip(
                         target, R2_MIN[j] - MARGIN, R2_MAX[j] + MARGIN)
+                q2_base = actions[step_i, 7:13].astype(np.float64)
 
-                # Grippers: the policy outputs joint deltas (same space as training data).
-                # Accumulate each step's predicted delta onto the running absolute position
-                # so the execution loop receives absolute [0,1] targets, not raw deltas.
                 g1_d   = np.clip(float(actions[step_i, 6]),  -args.max_step, args.max_step)
                 g1_abs = float(np.clip(g1_abs + g1_d, 0.0, 1.0))
                 actions[step_i, 6] = g1_abs
