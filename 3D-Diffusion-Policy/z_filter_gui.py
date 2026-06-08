@@ -297,7 +297,8 @@ class ZFilterWindow(QMainWindow):
         plot_layout = QVBoxLayout(plot_widget)
         plot_layout.setSpacing(4)
 
-        self.fig    = Figure(figsize=(18, 4), facecolor="#e8e8e8")
+        self.fig    = Figure(figsize=(18, 5), facecolor="#e8e8e8",
+                             constrained_layout=True)
         self.canvas = FigureCanvas(self.fig)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         plot_layout.addWidget(self.canvas)
@@ -305,8 +306,7 @@ class ZFilterWindow(QMainWindow):
         self.ax_top   = self.fig.add_subplot(141)   # top-down X vs Z
         self.ax_front = self.fig.add_subplot(142)   # front RGB, X vs Y
         self.ax_hist  = self.fig.add_subplot(143)   # depth histogram
-        self.ax_fps   = self.fig.add_subplot(144)   # FPS 1024-pt result
-        self.fig.tight_layout(pad=2.0)
+        self.ax_fps   = self.fig.add_subplot(144)   # FPS result
 
         # Frame scrubber bar
         frame_bar  = QWidget()
@@ -617,13 +617,13 @@ class ZFilterWindow(QMainWindow):
                             label=f"z_max={self.z_max:.2f}")
         self.ax_top.legend(fontsize=6, facecolor="white", labelcolor="#222222",
                            edgecolor="#cccccc")
+        self.ax_top.set_aspect('equal', adjustable='datalim')
 
         # ── 2. Front view: X vs Y, actual RGB ────────────────────────────────
         self._style_ax(self.ax_front, "Front View  (actual RGB)",
                        "X (m)", "Y (m)  [↑ up]")
         if len(removed) > 0:
             r = sub(removed, 8000)
-            # dim gray for filtered points
             gray = np.full((len(r), 3), 0.25, dtype=np.float32)
             self.ax_front.scatter(r[:, 0], -r[:, 1],
                                   s=0.4, c=gray, alpha=0.4)
@@ -631,6 +631,7 @@ class ZFilterWindow(QMainWindow):
             k = sub(kept, 8000)
             self.ax_front.scatter(k[:, 0], -k[:, 1],
                                   s=0.5, c=k[:, 3:6].clip(0, 1), alpha=0.95)
+        self.ax_front.set_aspect('equal', adjustable='datalim')
 
         # ── 3. Depth histogram ────────────────────────────────────────────────
         self._style_ax(self.ax_hist, "Depth Histogram",
@@ -649,7 +650,6 @@ class ZFilterWindow(QMainWindow):
         # ── 4. FPS panel ──────────────────────────────────────────────────────
         self._draw_fps_panel()
 
-        self.fig.tight_layout(pad=2.0)
         self.canvas.draw()
 
         n_kept = int(mask.sum())
@@ -680,9 +680,10 @@ class ZFilterWindow(QMainWindow):
                            f"FPS Result  ({n_actual:,} pts{dp3_note})",
                            "X (m)", "Y (m)  [↑ up]")
             p = self.fps_pts
-            pt_size = max(1.0, min(6.0, 4096 / max(n_actual, 1)))  # bigger dots for fewer pts
+            pt_size = max(1.0, min(6.0, 4096 / max(n_actual, 1)))
             self.ax_fps.scatter(p[:, 0], -p[:, 1],
                                 s=pt_size, c=p[:, 3:6].clip(0, 1), alpha=0.95)
+            self.ax_fps.set_aspect('equal', adjustable='datalim')
 
     # ── save ──────────────────────────────────────────────────────────────────
 
