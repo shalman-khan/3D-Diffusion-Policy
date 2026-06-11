@@ -493,15 +493,15 @@ def run(args):
                   f"g1_Δ={raw_delta[6]:.3f}  g2_Δ={raw_delta[13]:.3f}")
 
             # Seed running absolute positions from current state.
-            # Arms use rolling q1_base/q2_base so each step's delta integrates onto
-            # the previous step's target — matching how training deltas were computed:
-            #   action[k] = state[t+k+1] - state[t+k]  (relative to previous step)
-            # Grippers use g1_abs/g2_abs for the same reason.
-            g1_abs  = float(state_now[6])
-            g2_abs  = float(state_now[13])
+            # Arms: use obs state (matches training convention).
+            # Grippers: use live robots._g*_pos, NOT state_now[6/13].
+            #   state_now comes from obs_ring captured at inference start (~45ms ago).
+            #   During that time execution fires gripper commands advancing _g*_pos.
+            #   Seeding from stale obs causes g2_abs < _g2_pos → backward commands.
+            g1_abs  = float(robots._g1_pos)
+            g2_abs  = float(robots._g2_pos)
             q1_base = state_now[0:6].copy().astype(np.float64)
             q2_base = state_now[7:13].copy().astype(np.float64)
-
             for step_i in range(len(actions)):
                 if args.lock_robot1:
                     actions[step_i, 0:6] = state_now[0:6]
