@@ -465,6 +465,7 @@ def run(args):
     MARGIN = 0.15
 
     def inference_worker():
+        nonlocal g1_abs_carry, g2_abs_carry
         while not stop_infer.is_set():
             with obs_lock:
                 if len(obs_ring) < 2:
@@ -492,14 +493,14 @@ def run(args):
                   f"r2_Δmax={np.abs(raw_delta[7:13]).max():.4f}  "
                   f"g1_Δ={raw_delta[6]:.3f}  g2_Δ={raw_delta[13]:.3f}")
 
-            # Seed running absolute positions from current state.
-            # Arms: use obs state (matches training convention).
-            # Grippers: use live robots._g*_pos, NOT state_now[6/13].
-            #   state_now comes from obs_ring captured at inference start (~45ms ago).
-            #   During that time execution fires gripper commands advancing _g*_pos.
-            #   Seeding from stale obs causes g2_abs < _g2_pos → backward commands.
-            g1_abs  = float(robots._g1_pos)
-            g2_abs  = float(robots._g2_pos)
+            # Carry gripper absolute positions across chunks — do NOT re-seed
+            # from robots._g*_pos each call.  Inference for chunk N+1 runs while
+            # chunk N is still executing, so _g*_pos has not yet been updated by
+            # chunk N's final gripper command → re-seeding causes ~0.10 backward
+            # jumps on every chunk boundary.  Arms seed from obs (no carry needed
+            # because arm targets never hit a hard threshold filter like min_change).
+            g1_abs  = g1_abs_carry
+            g2_abs  = g2_abs_carry
             q1_base = state_now[0:6].copy().astype(np.float64)
             q2_base = state_now[7:13].copy().astype(np.float64)
             for step_i in range(len(actions)):
@@ -527,10 +528,23 @@ def run(args):
                 g2_abs = float(np.clip(g2_abs + g2_d, 0.0, 1.0))
                 actions[step_i, 13] = g2_abs
 
+            # Update carry for next chunk BEFORE putting in queue so the next
+            # inference call (which may start immediately) sees the right base.
+            g1_abs_carry = g1_abs
+            g2_abs_carry = g2_abs
+
             try:
                 action_queue.put(actions, timeout=0.1)
             except _queue.Full:
                 pass   # execution is behind — drop stale action
+
+    # Persistent gripper accumulators — initialized once from live state, then
+    # carried across chunks so chunk N+1 starts exactly where chunk N ended.
+    # Must NOT re-seed from robots._g*_pos each call: inference for chunk N+1
+    # runs while chunk N is still executing, so _g*_pos hasn't been updated yet
+    # by chunk N's final gripper command → backward jumps of ~0.10 per chunk.
+    g1_abs_carry = float(robots._g1_pos)
+    g2_abs_carry = float(robots._g2_pos)
 
     infer_thread = threading.Thread(target=inference_worker, daemon=True)
     infer_thread.start()
