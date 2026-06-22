@@ -273,12 +273,46 @@ class RobosuiteDataset(BaseDataset):
         if max_train_episodes is not None:
             train_mask[max_train_episodes:] = False
 
+        # ── Motion-aware sample index ─────────────────────────────────────────
+        # The real-robot zarr contains many near-static frames (robot settling,
+        # gripper actuation, pauses between motions). Sequences whose entire
+        # horizon has max arm delta < MOTION_THR teach the policy to predict
+        # near-zero — the primary cause of mode collapse on this dataset.
+        # Build the sampler normally, then drop indices whose full buffer window
+        # contains no arm motion above the threshold.
+        # Filter threshold: drop sequences whose MEAN arm motion across the full
+        # horizon window is below this value. Using mean (not max) prevents
+        # single-spike frames from rescuing otherwise-static sequences.
+        # At p50=0.007 rad for the 18june dataset, 0.005 drops ~35% of sequences.
+        MOTION_THR = 0.005   # rad mean across window — tune up if still collapsing
+
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
             sequence_length=horizon,
             pad_before=pad_before,
             pad_after=pad_after,
             episode_mask=train_mask)
+
+        all_actions  = np.array(self.replay_buffer["action"])     # (N, 14)
+        arm_deltas   = np.concatenate(
+            [all_actions[:, 0:6], all_actions[:, 7:13]], axis=1)  # (N, 12)
+        frame_motion = np.abs(arm_deltas).max(axis=1)             # (N,) per-frame
+
+        # sampler.indices: (M, 4)
+        #   buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx
+        # Keep sequence only if MEAN motion across its full buffer window >= threshold
+        idxs     = self.sampler.indices                           # (M, 4)
+        n_before = len(idxs)
+        keep     = np.array([
+            frame_motion[r[0]:r[1]].mean() >= MOTION_THR
+            for r in idxs
+        ], dtype=bool)
+        self.sampler.indices = idxs[keep]
+
+        print(f"[RobosuiteDataset] motion filter (mean thr={MOTION_THR} rad): "
+              f"kept {keep.sum()} / {n_before} sequences "
+              f"({100*keep.mean():.1f}%),  "
+              f"dropped {(~keep).sum()} near-static")
 
         self.train_mask  = train_mask
         self.horizon     = horizon
