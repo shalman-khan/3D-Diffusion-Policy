@@ -11,6 +11,7 @@ topics:
   depth:             /zed/zed_node/depth/depth_registered
   cam_info:          /zed/zed_node/depth/camera_info
   rgb:               /zed/zed_node/rgb/color/rect/image
+  point_cloud:       /zed/zed_node/point_cloud/cloud_registered
   robot1_joints:     /robot1/joint_states
   robot2_joints:     /robot2/joint_states
   gripper1_joints:   /gripper1/joint_states
@@ -53,69 +54,59 @@ joint_names:
     - gripper2_finger_joint
 
 # ---------------------------------------------------------------------------
-# Rosbag Data — 28May combined ZED sessions
+# Rosbag Data — 18June Risk sessions
 # Each session is a self-contained bag folder under base_dir containing
 # all ZED + robot/gripper topics.  Add or remove sessions as needed.
 # ---------------------------------------------------------------------------
 rosbag:
-  base_dir: "/media/rosi/T7 Shield/28May"
+  base_dir: "/media/rosi/T7 Shield/18June_Risk"
   sessions:
-    - session_20260528_060225_filtered
-    - session_20260528_060451_filtered
-    - session_20260528_060902_filtered
-    - session_20260528_061015_filtered
-    - session_20260528_064900_filtered
-    - session_20260528_064945_filtered
-    - session_20260528_065149_filtered
-    - session_20260528_065533_filtered
-    - session_20260528_065630_filtered
-    - session_20260528_070100_filtered
-    - session_20260528_070147_filtered
-    - session_20260528_070327_filtered
-    - session_20260528_070506_filtered
-    - session_20260528_071756_filtered
-    - session_20260528_071849_filtered
-    - session_20260528_071947_filtered
-    - session_20260528_072028_filtered
-    - session_20260528_072110_filtered
-    - session_20260528_072202_filtered
-    - session_20260528_072258_filtered
-    - session_20260528_072334_filtered
-    - session_20260528_072438_filtered
-    - session_20260528_072530_filtered
-    - session_20260528_072617_filtered
-    - session_20260528_072728_filtered
-    - session_20260528_072832_filtered
-    - session_20260528_072911_filtered
-    - session_20260528_072949_filtered
-    - session_20260528_073032_filtered
-    - session_20260528_073114_filtered
-    - session_20260528_073346_filtered
-    - session_20260528_073430_filtered
-    - session_20260528_073743_filtered
-    - session_20260528_074107_filtered
-    - session_20260528_074646_filtered
-    - session_20260528_074724_filtered
-    - session_20260528_074817_filtered
-    - session_20260528_074946_filtered
-    - session_20260528_075027_filtered
-    - session_20260528_075113_filtered
-    - session_20260528_075153_filtered
-    - session_20260528_075258_filtered
-    - session_20260528_075433_filtered
-    - session_20260528_075507_filtered
-    - session_20260528_075543_filtered
-    - session_20260528_091346_filtered
-    - session_20260528_092514_filtered
-    - session_20260528_093016_filtered
-    - session_20260528_094247_filtered
-    - session_20260528_100639_filtered
+    - session_20260618_033114_filtered
+    - session_20260618_033359_filtered
+    - session_20260618_033450_filtered
+    - session_20260618_033632_filtered
+    - session_20260618_033738_filtered
+    - session_20260618_033917_filtered
+    - session_20260618_034034_filtered
+    - session_20260618_034200_filtered
+    - session_20260618_034515_filtered
+    - session_20260618_034649_filtered
+    - session_20260618_034816_filtered
+    - session_20260618_034932_filtered
+    - session_20260618_035009_filtered
+    - session_20260618_035111_filtered
+    - session_20260618_035145_filtered
+    - session_20260618_035344_filtered
+    - session_20260618_035533_filtered
+    - session_20260618_035626_filtered
+    - session_20260618_035733_filtered
+    - session_20260618_035820_filtered
+    - session_20260618_053457_filtered
+    - session_20260618_053547_filtered
+    - session_20260618_053621_filtered
+    - session_20260618_053709_filtered
+    - session_20260618_054247_filtered
+    - session_20260618_054422_filtered
+    - session_20260618_054456_filtered
+    - session_20260618_054541_filtered
+    - session_20260618_054612_filtered
+    - session_20260618_054703_filtered
+    - session_20260618_054803_filtered
+    - session_20260618_055034_filtered
+    - session_20260618_055135_filtered
+    - session_20260618_055302_filtered
+    - session_20260618_055345_filtered
+    - session_20260618_055443_filtered
+    - session_20260618_055520_filtered
+    - session_20260618_055616_filtered
+    - session_20260618_055822_filtered
+    - session_20260618_055947_filtered
 
 # ---------------------------------------------------------------------------
 # Data Processing
 # ---------------------------------------------------------------------------
 data:
-  output_zarr:    /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/real_cable_pull_28may.zarr
+  output_zarr:    /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/real_cable_pull_18june.zarr
   target_hz:      20
   n_points:       8192                # FPS downsample target stored in zarr (max resolution)
                                     # dataset downsamples to task n_points at load time
@@ -131,21 +122,22 @@ workspace:
   z_min:  0.4   # must match z_filter_config.yaml used during training
   z_max:  1.1   # must match z_filter_config.yaml used during training
 
-# Action clipping — max joint delta per step (radians) and gripper delta (normalised 0-1)
+# Action — arms use joint deltas; the gripper is BINARY (open/close, no in-between).
 action:
   max_joint_delta:   0.05   # ~3 deg per step at 20Hz; tune to your teleoperation style
-  max_gripper_delta: 0.1
+  max_gripper_delta: 0.1    # (unused — gripper is now binary; kept for reference)
+  gripper_closed_threshold: 0.4   # finger position ≥ this ⇒ "closed" (1); else "open" (0)
 
 # ---------------------------------------------------------------------------
 # Robots — IP addresses and types
 # ---------------------------------------------------------------------------
 robots:
   robot1:
-    ip:   192.168.1.101    # ← set your UR10 IP
+    ip:   192.168.1.10
     type: ur10
     tf_prefix: robot1_
   robot2:
-    ip:   192.168.1.102    # ← set your UR10e IP
+    ip:   192.168.1.20
     type: ur10e
     tf_prefix: robot2_
 
@@ -153,8 +145,9 @@ robots:
 # Policy Execution
 # ---------------------------------------------------------------------------
 policy:
-  checkpoint_path:  /home/rosi/3D-Diffusion-Policy/data/outputs/real_cable_pull/checkpoints/epoch=0030-val_loss=0.018482.ckpt
-  task_config:      real_two_arm_lift
-  n_action_steps:   8     # how many actions to execute before re-querying
-  inference_steps:  3     # DDIM steps at eval time
-  obs_hz:           20    # observation polling rate
+  checkpoint_path:  /home/rosi/3D-Diffusion-Policy/data/outputs/real_cable_pull/checkpoints/latest.ckpt
+  task_config:      real_cable_pull
+  n_action_steps:   8     # must match training n_action_steps
+  inference_steps:  10    # DDIM steps at eval time
+  obs_hz:           20    # observation polling rate (must match training control_freq)
+  rtde_hz:          125   # RTDE polling rate

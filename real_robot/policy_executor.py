@@ -1,34 +1,31 @@
 #!/usr/bin/env python3
 """
-policy_executor.py
-==================
-ROS2 node that loads a trained DP3 checkpoint and runs closed-loop policy
-execution on the real robot.
+real_robot/policy_executor.py
+==============================
+Real-robot DP3 policy execution.
 
-Observation pipeline (same topics as rosbag recording):
-  /camera/camera/depth/color/points  → point_cloud (1024×6, XYZRGB)
-  /robot1/joint_states               → agent_pos[0:6]
-  /gripper1/joint_states             → agent_pos[6]
-  /robot2/joint_states               → agent_pos[7:13]
-  /gripper2/joint_states             → agent_pos[13]
+Architecture mirrors 3D-Diffusion-Policy/policy_executor.py:
+  - ROS2 camera node in a background thread (depth + rgb + cam_info)
+  - obs_worker thread: samples observation ring at obs_hz
+  - inference_worker thread: runs DDIM policy async
+  - Main control loop: executes action chunks via RTDE servoJ
 
-Action pipeline:
-  robot1/2 joint deltas → absolute positions → JointTrajectory (50ms horizon)
-    /robot1_joint_trajectory_controller/joint_trajectory
-    /robot2_joint_trajectory_controller/joint_trajectory
-  gripper deltas → absolute positions → /gripper{n}/cmd (Float64MultiArray)
-
-The JointTrajectoryController smoothly interpolates to the target position
-within the 50ms window (1 control step at 20Hz), giving smooth motion.
+Robot state (arm joints + gripper) is read directly via RTDE — no ROS2
+joint state subscriptions required.
 
 Run:
-  python policy_executor.py --config real_robot/real_config.yaml
+  python3 real_robot/policy_executor.py \
+    --config   real_robot/real_config.yaml \
+    --checkpoint /path/to/epoch=XXXX-val_loss=X.ckpt \
+    --n_action_steps 8 --infer_steps 10 --no_kickstart
 """
 
 import argparse
+import collections
+import queue as _queue
 import sys
+import threading
 import time
-from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -37,314 +34,256 @@ import yaml
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
-from sensor_msgs.msg import JointState, PointCloud2
-from std_msgs.msg import Float64MultiArray
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from builtin_interfaces.msg import Duration
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import Image, CameraInfo
 
-# Add DP3 to path
+import rtde_control
+import rtde_receive
+from rtde_control import RTDEControlInterface as RTDEControl
+from rtde_receive import RTDEReceiveInterface as RTDEReceive
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "3D-Diffusion-Policy"))
-
-from diffusion_policy_3d.workspace.train_dp3_workspace import TrainDP3Workspace
-from convert_rosbags_to_zarr import parse_pointcloud2_xyzrgb, crop_workspace, fps_numpy
+from train import TrainDP3Workspace
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Point cloud helpers — GPU FPS preferred (pytorch3d), CPU fallback
 # ---------------------------------------------------------------------------
 
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+try:
+    import pytorch3d.ops as _p3d_ops
+    _HAVE_P3D = True
+except ImportError:
+    _HAVE_P3D = False
+
+_obs_cuda_stream = None
 
 
-def extract_joint_positions(msg, joint_names: list) -> np.ndarray:
-    name_to_pos = dict(zip(msg.name, msg.position))
-    return np.array([name_to_pos[n] for n in joint_names], dtype=np.float32)
+def fps_or_pad(pts: np.ndarray, n: int) -> np.ndarray:
+    """Downsample (N,C) to (n,C) via FPS on GPU if available, else CPU."""
+    global _obs_cuda_stream
+    n_feat = pts.shape[1]
+    if len(pts) == 0:
+        return np.zeros((n, n_feat), dtype=np.float32)
+    if len(pts) <= n:
+        pad = np.zeros((n - len(pts), n_feat), dtype=np.float32)
+        return np.vstack([pts, pad]).astype(np.float32)
+
+    if _HAVE_P3D and torch.cuda.is_available():
+        if _obs_cuda_stream is None:
+            _obs_cuda_stream = torch.cuda.Stream()
+        n_pre = min(len(pts), max(n * 2, 16384))
+        if len(pts) > n_pre:
+            idx_pre = np.random.choice(len(pts), n_pre, replace=False)
+            pts_pre = pts[idx_pre]
+        else:
+            pts_pre = pts
+        with torch.cuda.stream(_obs_cuda_stream):
+            pts_t = torch.from_numpy(pts_pre).float().unsqueeze(0).cuda()
+            _, idx = _p3d_ops.sample_farthest_points(pts_t[..., :3], K=n)
+            result = pts_t[0, idx[0]].cpu().numpy()
+        _obs_cuda_stream.synchronize()
+        return result.astype(np.float32)
+
+    # CPU fallback
+    n_pre = min(len(pts), max(n, 8192))
+    if len(pts) > n_pre:
+        pts = pts[np.random.choice(len(pts), n_pre, replace=False)]
+    xyz = pts[:, :3]
+    sel = np.zeros(n, dtype=np.int64)
+    d   = np.full(len(pts), np.inf)
+    cur = 0
+    for i in range(n):
+        sel[i] = cur
+        nd  = np.sum((xyz - xyz[cur]) ** 2, axis=1)
+        d   = np.minimum(d, nd)
+        cur = int(np.argmax(d))
+    return pts[sel].astype(np.float32)
+
+
+def depth_to_pointcloud(depth_msg: Image, cam_msg: CameraInfo, rgb_msg: Image,
+                         ws: dict, n_points: int) -> np.ndarray:
+    """Reconstruct XYZRGB point cloud — same pipeline as training."""
+    h, w = depth_msg.height, depth_msg.width
+    enc_d = depth_msg.encoding
+    raw_d = bytes(depth_msg.data)
+    if enc_d == "32FC1":
+        depth = np.frombuffer(raw_d, dtype=np.float32).reshape(h, w)
+    elif enc_d == "16UC1":
+        depth = np.frombuffer(raw_d, dtype=np.uint16).reshape(h, w).astype(np.float32) / 1000.0
+    else:
+        raise ValueError(f"Unsupported depth encoding: {enc_d!r}")
+
+    fx, fy = cam_msg.k[0], cam_msg.k[4]
+    cx, cy = cam_msg.k[2], cam_msg.k[5]
+    us, vs = np.meshgrid(np.arange(w), np.arange(h))
+    z = depth
+    x = (us - cx) * z / fx
+    y = (vs - cy) * z / fy
+    pts = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+    valid = (np.isfinite(pts[:, 2])
+             & (pts[:, 0] >= ws["x_min"]) & (pts[:, 0] <= ws["x_max"])
+             & (pts[:, 1] >= ws["y_min"]) & (pts[:, 1] <= ws["y_max"])
+             & (pts[:, 2] >= ws["z_min"]) & (pts[:, 2] <= ws["z_max"]))
+    pts = pts[valid]
+
+    raw_rgb = np.frombuffer(bytes(rgb_msg.data), dtype=np.uint8)
+    enc = rgb_msg.encoding
+    if enc in ("bgra8", "rgba8"):
+        img = raw_rgb.reshape(h, w, 4)
+        r_ch = img[:, :, 2 if enc == "bgra8" else 0]
+        g_ch = img[:, :, 1]
+        b_ch = img[:, :, 0 if enc == "bgra8" else 2]
+    else:
+        img = raw_rgb.reshape(h, w, 3)
+        r_ch, g_ch, b_ch = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+    r = r_ch.reshape(-1)[valid].astype(np.float32) / 255.0
+    g = g_ch.reshape(-1)[valid].astype(np.float32) / 255.0
+    b = b_ch.reshape(-1)[valid].astype(np.float32) / 255.0
+    xyzrgb = np.column_stack([pts, r, g, b])
+    return fps_or_pad(xyzrgb, n_points)
+
+
+# ---------------------------------------------------------------------------
+# ROS2 camera node — spun in background thread, RTDE handles robot state
+# ---------------------------------------------------------------------------
+
+class CameraNode(Node):
+    def __init__(self, topics: dict):
+        super().__init__("dp3_camera_node")
+        be = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.depth_msg    = None
+        self.cam_info_msg = None
+        self.rgb_msg      = None
+        self.create_subscription(Image,      topics["depth"],    self._cb_d,  be)
+        self.create_subscription(CameraInfo, topics["cam_info"], self._cb_ci, be)
+        self.create_subscription(Image,      topics["rgb"],      self._cb_rgb, be)
+
+    def _cb_d(self,  m): self.depth_msg    = m
+    def _cb_ci(self, m): self.cam_info_msg = m
+    def _cb_rgb(self,m): self.rgb_msg      = m
+
+    def ready(self) -> bool:
+        return (self.depth_msg is not None
+                and self.cam_info_msg is not None
+                and self.rgb_msg is not None)
+
+
+# ---------------------------------------------------------------------------
+# BimanualRTDE — direct RTDE connection for both arms + grippers
+# (identical to 3D-Diffusion-Policy/policy_executor.py)
+# ---------------------------------------------------------------------------
+
+class BimanualRTDE:
+    LOOKAHEAD = 0.1
+    GAIN      = 300
+    ACC       = 1.0
+    VEL       = 1.0
+
+    def __init__(self, robot1_ip: str, robot2_ip: str, rtde_hz: int):
+        self.dt = 1.0 / rtde_hz
+        print(f"Connecting to robot1 @ {robot1_ip} ...")
+        self.rc1 = RTDEControl(robot1_ip)
+        self.rr1 = RTDEReceive(robot1_ip)
+        print(f"Connecting to robot2 @ {robot2_ip} ...")
+        self.rc2 = RTDEControl(robot2_ip)
+        self.rr2 = RTDEReceive(robot2_ip)
+        self._g1_pos = 1.0   # gripper1 starts closed (matches training init)
+        self._g2_pos = 0.0   # gripper2 starts open
+        print("RTDE connected.")
+
+    def get_state(self) -> np.ndarray:
+        """14-D [r1(6), g1(1), r2(6), g2(1)] — arms from RTDE, grippers local."""
+        r1 = np.array(self.rr1.getActualQ(), dtype=np.float32)
+        r2 = np.array(self.rr2.getActualQ(), dtype=np.float32)
+        g1 = np.array([self._g1_pos], dtype=np.float32)
+        g2 = np.array([self._g2_pos], dtype=np.float32)
+        return np.concatenate([r1, g1, r2, g2])
+
+    def get_joints(self):
+        return (np.array(self.rr1.getActualQ()),
+                np.array(self.rr2.getActualQ()))
+
+    def servoJ_step(self, q1: np.ndarray, q2: np.ndarray):
+        self.rc1.servoJ(q1.tolist(), self.VEL, self.ACC, self.dt, self.LOOKAHEAD, self.GAIN)
+        self.rc2.servoJ(q2.tolist(), self.VEL, self.ACC, self.dt, self.LOOKAHEAD, self.GAIN)
+
+    def set_gripper(self, which: int, position_01: float, min_change: float = 0.05):
+        cur = self._g1_pos if which == 1 else self._g2_pos
+        if abs(position_01 - cur) < min_change:
+            return
+        pos_byte = int(np.clip(position_01, 0.0, 1.0) * 255)
+        print(f"[GRIPPER] gripper{which}: {cur:.2f}→{position_01:.2f}  (byte={pos_byte})")
+        script = f"def grip():\n  rq_set_pos({pos_byte})\nend\ngrip()\n"
+        rc = self.rc1 if which == 1 else self.rc2
+        def _send():
+            try:
+                ok = rc.sendCustomScript(script)
+                if not ok:
+                    print(f"[WARN] gripper{which} sendCustomScript returned False")
+            except Exception as e:
+                print(f"[WARN] gripper{which} command failed: {e}")
+        threading.Thread(target=_send, daemon=True).start()
+        if which == 1:
+            self._g1_pos = float(np.clip(position_01, 0.0, 1.0))
+        else:
+            self._g2_pos = float(np.clip(position_01, 0.0, 1.0))
+
+    def stop(self):
+        self.rc1.servoStop()
+        self.rc2.servoStop()
+        self.rc1.stopScript()
+        self.rc2.stopScript()
+
+    def disconnect(self):
+        self.stop()
+        self.rc1.disconnect(); self.rc2.disconnect()
+        self.rr1.disconnect(); self.rr2.disconnect()
+
+
+def interpolate_waypoints(q_from: np.ndarray, q_to: np.ndarray, n: int):
+    return [q_from + (q_to - q_from) * (i + 1) / n for i in range(n)]
 
 
 # ---------------------------------------------------------------------------
 # Policy loader
 # ---------------------------------------------------------------------------
 
-def load_policy(checkpoint_path: str, inference_steps: int):
-    """Load DP3 policy from checkpoint, returning (policy, device, n_points)."""
-    import hydra
+def _read_n_points(cfg) -> int:
     from omegaconf import OmegaConf
-    import pathlib
+    for path in ("n_points",):
+        try:
+            v = OmegaConf.select(cfg, path)
+            if v is not None:
+                return int(v)
+        except Exception:
+            pass
+    for path in ("task.shape_meta.obs.point_cloud.shape",
+                 "shape_meta.obs.point_cloud.shape"):
+        try:
+            s = OmegaConf.select(cfg, path)
+            if s is not None:
+                return int(s[0])
+        except Exception:
+            pass
+    return 1024
 
+
+def load_policy(checkpoint_path: str, inference_steps: int):
     payload = torch.load(checkpoint_path, map_location="cpu")
     cfg = payload["cfg"]
-
-    # Override inference steps
     cfg.policy.num_inference_steps = inference_steps
-
-    workspace = TrainDP3Workspace(cfg)
-    workspace.load_payload(payload, exclude_keys=None, include_keys=None)
-    policy = workspace.model
-    if cfg.training.use_ema:
-        policy = workspace.ema_model
-
+    ws = TrainDP3Workspace(cfg)
+    ws.load_payload(payload, exclude_keys=None, include_keys=None)
+    policy = ws.ema_model if cfg.training.use_ema else ws.model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    policy.to(device)
-    policy.eval()
-
-    # Read n_points from checkpoint so inference matches training exactly
-    n_points = _read_n_points_from_cfg(cfg)
-    return policy, device, n_points
-
-
-def _read_n_points_from_cfg(cfg) -> int:
-    """Extract training n_points from a checkpoint config, with fallbacks."""
-    from omegaconf import OmegaConf
-    try:
-        val = OmegaConf.select(cfg, "n_points")
-        if val is not None:
-            return int(val)
-    except Exception:
-        pass
-    try:
-        return int(cfg.task.shape_meta.obs.point_cloud.shape[0])
-    except Exception:
-        pass
-    try:
-        return int(cfg.shape_meta.obs.point_cloud.shape[0])
-    except Exception:
-        pass
-    return 1024   # safe fallback for old checkpoints
-
-
-# ---------------------------------------------------------------------------
-# ROS2 node
-# ---------------------------------------------------------------------------
-
-class PolicyExecutorNode(Node):
-
-    def __init__(self, cfg: dict, policy, device: torch.device, n_points: int):
-        super().__init__("dp3_policy_executor")
-        self.cfg = cfg
-        self.policy = policy
-        self.device = device
-
-        jn = cfg["joint_names"]
-        self.r1_joint_names = jn["robot1"]
-        self.r2_joint_names = jn["robot2"]
-        self.g1_joint_names = jn["gripper1"]
-        self.g2_joint_names = jn["gripper2"]
-
-        n_obs = cfg["policy"]["n_action_steps"]  # reuse field for n_obs_steps buffer
-        self.n_obs_steps = 2  # hardcoded to match dp3.yaml
-        self.n_action_steps = cfg["policy"]["n_action_steps"]
-
-        self.ws = cfg["workspace"]
-        # n_pts comes from the checkpoint (training n_points), NOT from real_config.yaml
-        # real_config.yaml data.n_points controls zarr conversion resolution only
-        self.n_pts = n_points
-        self.max_jd = cfg["action"]["max_joint_delta"]
-        self.max_gd = cfg["action"]["max_gripper_delta"]
-        self.get_logger().info(f"Inference n_points={self.n_pts}")
-
-        # Observation buffers (deque of length n_obs_steps)
-        self.pc_buffer    = deque(maxlen=self.n_obs_steps)
-        self.state_buffer = deque(maxlen=self.n_obs_steps)
-
-        # Latest raw messages
-        self._latest_pc    = None
-        self._latest_r1    = None
-        self._latest_r2    = None
-        self._latest_g1    = None
-        self._latest_g2    = None
-
-        # Current joint positions (tracked for accumulating deltas → absolute)
-        self._current_r1_pos  = None
-        self._current_r2_pos  = None
-        self._current_g1_pos  = np.zeros(1, dtype=np.float32)
-        self._current_g2_pos  = np.zeros(1, dtype=np.float32)
-
-        # Pending action chunk (FIFO queue)
-        self._action_queue: deque = deque()
-
-        # QoS — best effort for high-freq sensor topics
-        sensor_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
-            depth=1,
-        )
-
-        topics = cfg["topics"]
-        self.create_subscription(PointCloud2, topics["point_cloud"],    self._cb_pc,    sensor_qos)
-        self.create_subscription(JointState,  topics["robot1_joints"],  self._cb_r1,    10)
-        self.create_subscription(JointState,  topics["robot2_joints"],  self._cb_r2,    10)
-        self.create_subscription(JointState,  topics["gripper1_joints"],self._cb_g1,    10)
-        self.create_subscription(JointState,  topics["gripper2_joints"],self._cb_g2,    10)
-
-        action_topics = cfg["action_topics"]
-        # Robots: JointTrajectory for smooth interpolation within each 50ms step
-        self._pub_r1 = self.create_publisher(JointTrajectory,   action_topics["robot1_command"],   10)
-        self._pub_r2 = self.create_publisher(JointTrajectory,   action_topics["robot2_command"],   10)
-        # Grippers: Float64MultiArray (gripper driver interface unchanged)
-        self._pub_g1 = self.create_publisher(Float64MultiArray, action_topics["gripper1_command"], 10)
-        self._pub_g2 = self.create_publisher(Float64MultiArray, action_topics["gripper2_command"], 10)
-
-        # Step duration = 1 / obs_hz (nanoseconds)
-        obs_hz = cfg["policy"]["obs_hz"]
-        step_ns = int(1e9 / obs_hz)
-        self._step_duration = Duration(sec=0, nanosec=step_ns)
-
-        self._control_timer = self.create_timer(1.0 / obs_hz, self._control_loop)
-
-        self.get_logger().info("PolicyExecutorNode ready. Waiting for observations...")
-
-    # --- Subscribers ---
-
-    def _cb_pc(self, msg):
-        self._latest_pc = msg
-
-    def _cb_r1(self, msg):
-        self._latest_r1 = msg
-        try:
-            self._current_r1_pos = extract_joint_positions(msg, self.r1_joint_names)
-        except KeyError:
-            pass
-
-    def _cb_r2(self, msg):
-        self._latest_r2 = msg
-        try:
-            self._current_r2_pos = extract_joint_positions(msg, self.r2_joint_names)
-        except KeyError:
-            pass
-
-    def _cb_g1(self, msg):
-        self._latest_g1 = msg
-        if msg.position:
-            self._current_g1_pos = np.array([msg.position[0]], dtype=np.float32)
-
-    def _cb_g2(self, msg):
-        self._latest_g2 = msg
-        if msg.position:
-            self._current_g2_pos = np.array([msg.position[0]], dtype=np.float32)
-
-    # --- Observation assembly ---
-
-    def _build_obs_frame(self):
-        """Build one observation frame. Returns (pc, agent_pos) or None."""
-        if any(x is None for x in [self._latest_pc, self._latest_r1, self._latest_r2]):
-            return None
-
-        # Point cloud
-        xyzrgb = parse_pointcloud2_xyzrgb(self._latest_pc)
-        xyzrgb = crop_workspace(xyzrgb, self.ws)
-        pc     = fps_numpy(xyzrgb, self.n_pts)   # (1024, 6)
-
-        # Joint positions
-        try:
-            r1 = extract_joint_positions(self._latest_r1, self.r1_joint_names)
-            r2 = extract_joint_positions(self._latest_r2, self.r2_joint_names)
-        except KeyError as e:
-            self.get_logger().warn(f"Joint name mismatch: {e}")
-            return None
-
-        g1 = self._current_g1_pos
-        g2 = self._current_g2_pos
-
-        agent_pos = np.concatenate([r1, g1, r2, g2]).astype(np.float32)  # (14,)
-        return pc, agent_pos
-
-    # --- Control loop ---
-
-    def _control_loop(self):
-        # If action queue has pending actions, execute next one
-        if self._action_queue:
-            action = self._action_queue.popleft()
-            self._execute_action(action)
-            return
-
-        # Otherwise collect observation and run policy
-        frame = self._build_obs_frame()
-        if frame is None:
-            return
-
-        pc, agent_pos = frame
-        self.pc_buffer.append(pc)
-        self.state_buffer.append(agent_pos)
-
-        if len(self.pc_buffer) < self.n_obs_steps:
-            return  # Wait until buffer is full
-
-        # Build obs dict — stack last n_obs_steps frames
-        pc_seq    = np.stack(list(self.pc_buffer),    axis=0)  # (n_obs, 1024, 3)
-        state_seq = np.stack(list(self.state_buffer), axis=0)  # (n_obs, 14)
-
-        obs_dict = {
-            "point_cloud": torch.from_numpy(pc_seq[None]).float().to(self.device),    # (1, n_obs, 1024, 3)
-            "agent_pos":   torch.from_numpy(state_seq[None]).float().to(self.device), # (1, n_obs, 14)
-        }
-
-        # Run policy
-        with torch.no_grad():
-            action_dict = self.policy.predict_action(obs_dict)
-
-        action_seq = action_dict["action"][0].cpu().numpy()  # (n_action_steps, 14)
-        del obs_dict, action_dict
-        torch.cuda.empty_cache()
-
-        # Queue all actions in the chunk
-        for i in range(self.n_action_steps):
-            self._action_queue.append(action_seq[i])
-
-        # Execute first action immediately
-        if self._action_queue:
-            self._execute_action(self._action_queue.popleft())
-
-    # --- Action execution ---
-
-    def _execute_action(self, action: np.ndarray):
-        """
-        Convert joint delta action → absolute positions → publish.
-        action: (14,) = r1_delta(6) + g1_delta(1) + r2_delta(6) + g2_delta(1)
-
-        Robots: published as JointTrajectory with time_from_start = 1 step (50ms).
-        The JointTrajectoryController smoothly interpolates to the target within
-        that window, preventing hard position jumps between DP3 steps.
-
-        Grippers: published as Float64MultiArray (passthrough to gripper driver).
-        """
-        if self._current_r1_pos is None or self._current_r2_pos is None:
-            self.get_logger().warn("No current joint positions available yet, skipping action")
-            return
-
-        r1_delta = np.clip(action[0:6],   -self.max_jd, self.max_jd)
-        g1_delta = np.clip(action[6:7],   -self.max_gd, self.max_gd)
-        r2_delta = np.clip(action[7:13],  -self.max_jd, self.max_jd)
-        g2_delta = np.clip(action[13:14], -self.max_gd, self.max_gd)
-
-        r1_target = self._current_r1_pos + r1_delta
-        r2_target = self._current_r2_pos + r2_delta
-        g1_target = np.clip(self._current_g1_pos + g1_delta, 0.0, 1.0)
-        g2_target = np.clip(self._current_g2_pos + g2_delta, 0.0, 1.0)
-
-        # Robot 1 — smooth trajectory waypoint
-        traj_r1 = JointTrajectory()
-        traj_r1.joint_names = self.r1_joint_names
-        pt_r1 = JointTrajectoryPoint()
-        pt_r1.positions = r1_target.tolist()
-        pt_r1.time_from_start = self._step_duration
-        traj_r1.points = [pt_r1]
-        self._pub_r1.publish(traj_r1)
-
-        # Robot 2 — smooth trajectory waypoint
-        traj_r2 = JointTrajectory()
-        traj_r2.joint_names = self.r2_joint_names
-        pt_r2 = JointTrajectoryPoint()
-        pt_r2.positions = r2_target.tolist()
-        pt_r2.time_from_start = self._step_duration
-        traj_r2.points = [pt_r2]
-        self._pub_r2.publish(traj_r2)
-
-        # Grippers — passthrough
-        self._pub_g1.publish(Float64MultiArray(data=g1_target.tolist()))
-        self._pub_g2.publish(Float64MultiArray(data=g2_target.tolist()))
+    policy.to(device).eval()
+    return policy, device, _read_n_points(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -353,28 +292,240 @@ class PolicyExecutorNode(Node):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config",     default=str(Path(__file__).parent / "real_config.yaml"))
-    parser.add_argument("--checkpoint", default=None, help="Override checkpoint path from config")
+    parser.add_argument("--config",         default=str(Path(__file__).parent / "real_config.yaml"))
+    parser.add_argument("--checkpoint",     default=None)
+    parser.add_argument("--robot1_ip",      default=None)
+    parser.add_argument("--robot2_ip",      default=None)
+    parser.add_argument("--hz",             type=float, default=None, help="Obs/control Hz")
+    parser.add_argument("--rtde_hz",        type=int,   default=None, help="RTDE servo Hz")
+    parser.add_argument("--n_action_steps", type=int,   default=None)
+    parser.add_argument("--infer_steps",    type=int,   default=None)
+    parser.add_argument("--max_step",       type=float, default=0.05, help="Max joint delta per step")
+    parser.add_argument("--no_kickstart",   action="store_true")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
 
-    ckpt = args.checkpoint or cfg["policy"]["checkpoint_path"]
-    inference_steps = cfg["policy"]["inference_steps"]
+    robot1_ip     = args.robot1_ip  or cfg["robots"]["robot1"]["ip"]
+    robot2_ip     = args.robot2_ip  or cfg["robots"]["robot2"]["ip"]
+    hz            = args.hz         or cfg["policy"]["obs_hz"]
+    rtde_hz       = args.rtde_hz    or cfg["policy"]["rtde_hz"]
+    n_action_steps= args.n_action_steps or cfg["policy"]["n_action_steps"]
+    infer_steps   = args.infer_steps    or cfg["policy"]["inference_steps"]
+    ckpt          = args.checkpoint     or cfg["policy"]["checkpoint_path"]
+    ws            = cfg["workspace"]
+    max_step      = args.max_step
+    interp_steps  = max(1, rtde_hz // hz)
 
     print(f"Loading policy from: {ckpt}")
-    policy, device, n_points = load_policy(ckpt, inference_steps)
+    policy, device, n_points = load_policy(ckpt, infer_steps)
     print(f"Policy loaded on {device}  |  n_points={n_points}")
+    print(f"hz={hz}  rtde_hz={rtde_hz}  n_action_steps={n_action_steps}"
+          f"  infer_steps={infer_steps}  interp_steps={interp_steps}")
 
+    # ── ROS2 camera ──
     rclpy.init()
-    node = PolicyExecutorNode(cfg, policy, device, n_points)
+    camera = CameraNode(cfg["topics"])
+    spin_thread = threading.Thread(target=rclpy.spin, args=(camera,), daemon=True)
+    spin_thread.start()
+    print("Waiting for ZED depth + RGB + camera_info ...")
+    while not camera.ready():
+        time.sleep(0.05)
+    print("Camera ready.")
 
+    # ── RTDE robot connections ──
+    robots = BimanualRTDE(robot1_ip, robot2_ip, rtde_hz)
+
+    # ── GPU warm-up ──
+    dummy_pc  = torch.zeros(1, 2, n_points, 6).to(device)
+    dummy_pos = torch.zeros(1, 2, 14).to(device)
+    for _ in range(3):
+        t_w = time.time()
+        with torch.no_grad():
+            policy.predict_action({"point_cloud": dummy_pc, "agent_pos": dummy_pos})
+    infer_ms = (time.time() - t_w) * 1000
+    print(f"Inference: {infer_ms:.0f} ms  ({1000/infer_ms:.1f} Hz)\n")
+
+    # ── obs_worker thread: samples at exactly hz ──
+    obs_lock = threading.Lock()
+    obs_ring = collections.deque(maxlen=2)
+    stop_obs = threading.Event()
+
+    def obs_worker():
+        interval = 1.0 / hz
+        while not stop_obs.is_set():
+            t0 = time.time()
+            try:
+                pc    = depth_to_pointcloud(camera.depth_msg, camera.cam_info_msg,
+                                             camera.rgb_msg, ws, n_points)
+                state = robots.get_state()
+                with obs_lock:
+                    obs_ring.append((pc, state))
+            except Exception as e:
+                print(f"[obs_worker] {e}", flush=True)
+            elapsed = time.time() - t0
+            wait = interval - elapsed
+            if wait > 0:
+                time.sleep(wait)
+
+    obs_thread = threading.Thread(target=obs_worker, daemon=True)
+    obs_thread.start()
+    time.sleep(0.15)   # fill obs ring (2 frames @ 50 ms spacing)
+
+    # ── Optional kickstart ──
+    if not args.no_kickstart:
+        print("Kickstart: nudging robot2 wrist +0.08 rad ...")
+        q1_cur, q2_cur = robots.get_joints()
+        q2_nudge = q2_cur.copy(); q2_nudge[5] += 0.08
+        for q1_wp, q2_wp in zip(interpolate_waypoints(q1_cur, q1_cur, interp_steps),
+                                 interpolate_waypoints(q2_cur, q2_nudge, interp_steps)):
+            t_s = time.time()
+            robots.servoJ_step(q1_wp, q2_wp)
+            wait = (1.0 / rtde_hz) - (time.time() - t_s)
+            if wait > 0:
+                time.sleep(wait)
+        time.sleep(0.06)
+        print("Kickstart done.\n")
+    else:
+        print("Kickstart disabled.\n")
+
+    # ── inference_worker thread ──
+    action_queue = _queue.Queue(maxsize=2)
+    stop_infer   = threading.Event()
+
+    LATCH_COUNT    = 5
+    g1_latch_count = 0
+    g2_latch_count = 0
+    g1_latched     = False
+    g2_latched     = False
+    g1_abs_carry   = float(robots._g1_pos)
+    g2_abs_carry   = float(robots._g2_pos)
+
+    def inference_worker():
+        nonlocal g1_abs_carry, g2_abs_carry
+        nonlocal g1_latch_count, g2_latch_count, g1_latched, g2_latched
+        while not stop_infer.is_set():
+            with obs_lock:
+                if len(obs_ring) < 2:
+                    time.sleep(0.01)
+                    continue
+                obs_a, obs_b = list(obs_ring)
+
+            state_now = obs_b[1]
+            pc_t    = torch.from_numpy(
+                          np.stack([obs_a[0], obs_b[0]], axis=0)
+                      ).float().unsqueeze(0).to(device)
+            state_t = torch.from_numpy(
+                          np.stack([obs_a[1], obs_b[1]], axis=0)
+                      ).float().unsqueeze(0).to(device)
+
+            t_inf = time.time()
+            with torch.no_grad():
+                result = policy.predict_action({"point_cloud": pc_t, "agent_pos": state_t})
+            infer_ms = (time.time() - t_inf) * 1000
+            actions  = result["action"].squeeze(0).cpu().numpy()   # (n_action_steps, 14)
+
+            raw_d = actions[0].copy()
+            print(
+                f"  infer={infer_ms:4.0f}ms"
+                f"  r1_Δmax={np.abs(raw_d[0:6]).max():.4f}"
+                f"  r2_Δmax={np.abs(raw_d[7:13]).max():.4f}"
+                f"  g1_Δ={raw_d[6]:.3f}  g2_Δ={raw_d[13]:.3f}",
+                flush=True,
+            )
+
+            # Accumulate deltas → absolute targets; apply gripper latch
+            q1_base = state_now[0:6].copy().astype(np.float64)
+            q2_base = state_now[7:13].copy().astype(np.float64)
+            g1_abs  = g1_abs_carry
+            g2_abs  = g2_abs_carry
+
+            for i in range(len(actions)):
+                for j in range(6):
+                    d = np.clip(float(actions[i, j]), -max_step, max_step)
+                    actions[i, j] = q1_base[j] + d
+                q1_base = actions[i, 0:6].copy()
+
+                for j in range(6):
+                    d = np.clip(float(actions[i, 7 + j]), -max_step, max_step)
+                    actions[i, 7 + j] = q2_base[j] + d
+                q2_base = actions[i, 7:13].copy()
+
+                g1_d  = np.clip(float(actions[i, 6]),  -max_step, max_step)
+                g1_abs = float(np.clip(g1_abs + g1_d, 0.0, 1.0))
+                if g1_abs >= 0.99:
+                    g1_latch_count += 1
+                if g1_latch_count >= LATCH_COUNT:
+                    g1_latched = True
+                if g1_latched:
+                    g1_abs = 1.0
+                actions[i, 6] = g1_abs
+
+                g2_d  = np.clip(float(actions[i, 13]), -max_step, max_step)
+                g2_abs = float(np.clip(g2_abs + g2_d, 0.0, 1.0))
+                if g2_abs >= 0.99:
+                    g2_latch_count += 1
+                if g2_latch_count >= LATCH_COUNT:
+                    g2_latched = True
+                if g2_latched:
+                    g2_abs = 1.0
+                actions[i, 13] = g2_abs
+
+            g1_abs_carry = g1_abs
+            g2_abs_carry = g2_abs
+
+            try:
+                action_queue.put(actions, timeout=0.1)
+            except _queue.Full:
+                pass   # execution behind — drop stale chunk
+
+    infer_thread = threading.Thread(target=inference_worker, daemon=True)
+    infer_thread.start()
+
+    print("Waiting for first inference result ...")
+    first_actions = action_queue.get()
+    print("First action ready — starting execution.\n")
+
+    # ── Main control loop ──
     try:
-        rclpy.spin(node)
+        print(f"=== DP3 Execution  ({n_action_steps} steps/chunk @ {hz} Hz, Ctrl+C to stop) ===\n")
+        actions = first_actions
+        while True:
+            for step_idx in range(n_action_steps):
+                act       = actions[step_idx]
+                q1_target = act[0:6]
+                q2_target = act[7:13]
+                g1_target = float(act[6])
+                g2_target = float(act[13])
+
+                q1_cur, q2_cur = robots.get_joints()
+                for q1_wp, q2_wp in zip(
+                        interpolate_waypoints(q1_cur, q1_target, interp_steps),
+                        interpolate_waypoints(q2_cur, q2_target, interp_steps)):
+                    t_s = time.time()
+                    robots.servoJ_step(q1_wp, q2_wp)
+                    wait = (1.0 / rtde_hz) - (time.time() - t_s)
+                    if wait > 0:
+                        time.sleep(wait)
+
+                robots.set_gripper(1, g1_target)
+                robots.set_gripper(2, g2_target)
+
+            try:
+                actions = action_queue.get(timeout=0.5)
+            except _queue.Empty:
+                print("[WARN] inference too slow — holding last action")
+
     except KeyboardInterrupt:
-        pass
+        print("\nStopping ...")
     finally:
-        node.destroy_node()
+        stop_infer.set()
+        stop_obs.set()
+        infer_thread.join(timeout=1.0)
+        obs_thread.join(timeout=1.0)
+        robots.disconnect()
+        camera.destroy_node()
         rclpy.shutdown()
 
 

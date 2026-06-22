@@ -466,6 +466,7 @@ def run(args):
 
     def inference_worker():
         nonlocal g1_abs_carry, g2_abs_carry
+        nonlocal g1_latch_count, g2_latch_count, g1_latched, g2_latched
         while not stop_infer.is_set():
             with obs_lock:
                 if len(obs_ring) < 2:
@@ -522,10 +523,22 @@ def run(args):
 
                 g1_d   = np.clip(float(actions[step_i, 6]),  -args.max_step, args.max_step)
                 g1_abs = float(np.clip(g1_abs + g1_d, 0.0, 1.0))
+                if g1_abs >= 0.99:
+                    g1_latch_count += 1
+                if g1_latch_count >= LATCH_COUNT:
+                    g1_latched = True
+                if g1_latched:
+                    g1_abs = 1.0
                 actions[step_i, 6] = g1_abs
 
                 g2_d   = np.clip(float(actions[step_i, 13]), -args.max_step, args.max_step)
                 g2_abs = float(np.clip(g2_abs + g2_d, 0.0, 1.0))
+                if g2_abs >= 0.99:
+                    g2_latch_count += 1
+                if g2_latch_count >= LATCH_COUNT:
+                    g2_latched = True
+                if g2_latched:
+                    g2_abs = 1.0
                 actions[step_i, 13] = g2_abs
 
             # Update carry for next chunk BEFORE putting in queue so the next
@@ -545,6 +558,15 @@ def run(args):
     # by chunk N's final gripper command → backward jumps of ~0.10 per chunk.
     g1_abs_carry = float(robots._g1_pos)
     g2_abs_carry = float(robots._g2_pos)
+
+    # Gripper latch: count how many times accumulated abs reaches 1.0 (closed).
+    # Before reaching 5 counts, stay at current accumulation.
+    # After 5 counts, pin permanently at 1.0 — prevents oscillation.
+    LATCH_COUNT  = 5
+    g1_latch_count = 0
+    g2_latch_count = 0
+    g1_latched     = False
+    g2_latched     = False
 
     infer_thread = threading.Thread(target=inference_worker, daemon=True)
     infer_thread.start()
@@ -613,10 +635,10 @@ def main():
     parser.add_argument("--robot2_ip",  default=ROBOT2_IP)
     parser.add_argument("--hz",             type=int, default=20,  help="DP3 inference rate")
     parser.add_argument("--rtde_hz",        type=int, default=125, help="RTDE servoJ rate")
-    parser.add_argument("--n_action_steps", type=int, default=2,
-                        help="Action steps per inference chunk (default 2: 2×48ms=96ms > 65ms inference → zero gap)")
-    parser.add_argument("--infer_steps",    type=int,   default=5,
-                        help="Diffusion denoising steps at inference (default 5, trained with 10)")
+    parser.add_argument("--n_action_steps", type=int, default=8,
+                        help="Action steps per inference chunk — must match training n_action_steps (default 8)")
+    parser.add_argument("--infer_steps",    type=int,   default=10,
+                        help="Diffusion denoising steps at inference — must match training num_inference_steps (default 10)")
     parser.add_argument("--action_scale",  type=float, default=1.0,
                         help="Amplify predicted delta on robot2 only (default 1.0 = no amplification).")
     parser.add_argument("--max_step",      type=float, default=0.05,

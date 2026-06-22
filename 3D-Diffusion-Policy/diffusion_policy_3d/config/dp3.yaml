@@ -118,7 +118,7 @@ training:
   gradient_accumulate_every: 1
   use_ema: True
   rollout_every: 500
-  checkpoint_every: 10
+  checkpoint_every: 1
   val_every: 1
   sample_every: 5
   max_train_steps: null
@@ -136,13 +136,13 @@ logging:
   - dp3
 
 checkpoint:
-  save_ckpt: True # save checkpoint every checkpoint_every
+  save_ckpt: True
   topk:
     monitor_key: val_loss
     mode: min
-    k: 20
+    k: 5                   # keep only the 5 best val_loss checkpoints
     format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
-  save_last_ckpt: True # this only saves when save_ckpt is True
+  save_last_ckpt: False    # don't save latest.ckpt every epoch — best-val only
   save_last_snapshot: False
 
 multi_run:

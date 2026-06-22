@@ -100,13 +100,7 @@ PCL_FILTER = {
     "z_min":  0.4, "z_max": 1.1,
 }
 
-# Joint position controller for POLICY EXECUTION.
-# ramp_ratio=1.0 (vs 0.2 in the collection script): apply the full commanded
-# delta immediately each step.  During collection, ramp_ratio=0.2 attenuated
-# large teleop commands and the stored action = np.diff(state) already reflects
-# that attenuation.  If we feed those small stored deltas back through ramp=0.2
-# they get attenuated AGAIN → 5x slower execution.  ramp=1.0 removes this
-# double-ramp and restores demo speed.
+# Joint position controller — identical to the collection script.
 JOINT_POS_CONTROLLER_CONFIG = {
     "type": "BASIC",
     "body_parts": {
@@ -123,7 +117,7 @@ JOINT_POS_CONTROLLER_CONFIG = {
             "damping_ratio_limits": [0, 10],
             "qpos_limits": None,
             "interpolation": None,
-            "ramp_ratio": 1.0,
+            "ramp_ratio": 0.2,
             "gripper": {"type": "GRIP"},
         }
     },
@@ -181,7 +175,6 @@ class SimCablePullRunner(BaseRunner):
     def __init__(self, output_dir, n_train=20, max_steps=600,
                  n_obs_steps=2, n_action_steps=8, fps=20,
                  task_name="TwoArmPullApart", render=False, view_camera="birdview",
-                 action_scale=5.0,
                  **kwargs):
         super().__init__(output_dir)
         self.output_dir = output_dir
@@ -190,7 +183,6 @@ class SimCablePullRunner(BaseRunner):
         self.n_obs_steps = n_obs_steps
         self.n_action_steps = n_action_steps
         self.task_name = task_name
-        self.action_scale = action_scale
         self.render = render   # show the rollout in an OpenCV window (offscreen+imshow)
 
         # On-screen view via robosuite's OpenCV viewer (works with MUJOCO_GL=egl).
@@ -245,32 +237,21 @@ class SimCablePullRunner(BaseRunner):
             "agent_pos":   agent_pos.astype(np.float32),
         }
 
-    def _delta_to_env_action(self, action14, g0_closed, g1_closed):
+    def _delta_to_env_action(self, action14, obs):
         """14-D policy output -> native 14-D env action (both arms).
 
-        Arm joints: scaled by action_scale then normalised to [-1,1] for the controller.
-        Grippers:   hysteresis around 0.5 — open threshold 0.35, close threshold 0.65 —
-                    to prevent flickering at the binary decision boundary.
+        Arm joints: input = delta / OUTPUT_MAX reproduces "current_qpos + delta".
+        Grippers:   BINARY — GRIP command +1 (close) / -1 (open).
         """
         a = np.asarray(action14, dtype=float)
-        scaled0 = a[0:6]  * self.action_scale
-        scaled1 = a[7:13] * self.action_scale
-        arm0 = np.clip(np.clip(scaled0, -MAX_JOINT_DELTA, MAX_JOINT_DELTA) / OUTPUT_MAX, -1.0, 1.0)
-        arm1 = np.clip(np.clip(scaled1, -MAX_JOINT_DELTA, MAX_JOINT_DELTA) / OUTPUT_MAX, -1.0, 1.0)
-        # Hysteresis: only switch state when prediction is confident
-        if g0_closed:
-            new_g0_closed = False if a[6] < 0.35 else True
-        else:
-            new_g0_closed = True if a[6] > 0.65 else False
-        if g1_closed:
-            new_g1_closed = False if a[13] < 0.35 else True
-        else:
-            new_g1_closed = True if a[13] > 0.65 else False
-        g0 = 1.0 if new_g0_closed else -1.0
-        g1 = 1.0 if new_g1_closed else -1.0
-        return np.concatenate([arm0, [g0], arm1, [g1]]).astype(np.float64), new_g0_closed, new_g1_closed
+        arm0 = np.clip(np.clip(a[0:6],  -MAX_JOINT_DELTA, MAX_JOINT_DELTA) / OUTPUT_MAX, -1.0, 1.0)
+        arm1 = np.clip(np.clip(a[7:13], -MAX_JOINT_DELTA, MAX_JOINT_DELTA) / OUTPUT_MAX, -1.0, 1.0)
+        g0 = 1.0 if a[6]  >= 0.5 else -1.0
+        g1 = 1.0 if a[13] >= 0.5 else -1.0
+        return np.concatenate([arm0, [g0], arm1, [g1]]).astype(np.float64)
 
     def run(self, policy):
+        print("DEBUG: run() called", flush=True)
         device = policy.device
         all_rewards, all_successes = [], []
 
@@ -284,8 +265,10 @@ class SimCablePullRunner(BaseRunner):
             step = 0
             episode_reward = 0.0
             is_success = False
-            g0_closed = False   # gripper hysteresis state — both start open
-            g1_closed = False
+            g0_latched = False  # once True, g0 stays CLOSE for this episode
+            g1_latched = False
+            g0_ones = 0          # count of raw==1.0 predictions; latch at 5
+            g1_ones = 0
 
             while not done and step < self.max_steps:
                 obs_deque.append(self._extract_obs(obs))
@@ -306,8 +289,20 @@ class SimCablePullRunner(BaseRunner):
                 action_seq = action_dict["action"][0].cpu().numpy()   # (n_action_steps, 14)
 
                 for action14 in action_seq[:self.n_action_steps]:
-                    env_action, g0_closed, g1_closed = self._delta_to_env_action(
-                        action14, g0_closed, g1_closed)
+                    env_action = self._delta_to_env_action(action14, obs)
+                    # Accumulate count of raw==1.0 predictions; latch after 5.
+                    # Before latching, force OPEN so partial predictions don't flicker.
+                    if action14[6] >= 0.99:
+                        g0_ones += 1
+                    if action14[13] >= 0.99:
+                        g1_ones += 1
+                    if g0_ones >= 10:
+                        g0_latched = True
+                    if g1_ones >= 10:
+                        g1_latched = True
+                    env_action[6]  = 1.0 if g0_latched else -1.0
+                    env_action[13] = 1.0 if g1_latched else -1.0
+                    print(f"  step={step:5d}  g0_raw={action14[6]:.3f} cnt={g0_ones}->{'CLOSE[L]' if g0_latched else 'OPEN'}  g1_raw={action14[13]:.3f} cnt={g1_ones}->{'CLOSE[L]' if g1_latched else 'OPEN'}", flush=True)
                     obs, reward, done, info = self.env.step(env_action)
                     if self.render:
                         self.env.render()
