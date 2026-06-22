@@ -17,6 +17,64 @@ from diffusion_policy_3d.dataset.base_dataset import BaseDataset
 
 
 # ---------------------------------------------------------------------------
+# 3-D point cloud augmentation helpers
+# ---------------------------------------------------------------------------
+
+def _random_yaw_matrix() -> np.ndarray:
+    """Random rotation matrix around the Z (gravity) axis, uniform in [-15°, +15°]."""
+    angle = np.random.uniform(-np.pi / 12, np.pi / 12)   # ±15 deg
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[c, -s, 0.0],
+                     [s,  c, 0.0],
+                     [0.0, 0.0, 1.0]], dtype=np.float32)
+
+
+def augment_point_cloud_sequence(point_cloud: np.ndarray) -> np.ndarray:
+    """
+    Apply randomised augmentations to a (T, N, C) point cloud sequence.
+
+    Augmentation order (must not be reordered — see inline notes):
+      1. Yaw rotation  — before scale/jitter so noise is not amplified by R
+      2. XY translation — same SE(3) step; point-cloud-only (actions are joint
+                          deltas in joint space, not Cartesian poses, so no
+                          action transform is required or correct)
+      3. Uniform scale ±10%
+      4. XYZ jitter σ=0.005 m — after scale so magnitude stays sensor-relative
+      5. RGB brightness jitter ±10% (channels 3-5 if C≥6)
+      6. Random dropout 5% — last, so FPS/padding downstream sees full density
+
+    Returns augmented copy; does NOT modify the input array.
+    """
+    pc = point_cloud.copy()
+    T, N, C = pc.shape
+
+    # 1 & 2 — Yaw rotation + XY translation (point cloud only)
+    R = _random_yaw_matrix()                                   # (3, 3)
+    t = np.array([np.random.uniform(-0.03, 0.03),              # ±3 cm X
+                  np.random.uniform(-0.03, 0.03),              # ±3 cm Y
+                  0.0], dtype=np.float32)                      # no Z shift
+    pc[..., :3] = pc[..., :3] @ R.T + t                       # broadcast over T, N
+
+    # 3 — Uniform scale ±10%
+    scale = np.float32(np.random.uniform(0.90, 1.10))
+    pc[..., :3] *= scale
+
+    # 4 — XYZ jitter
+    pc[..., :3] += (np.random.randn(T, N, 3) * 0.005).astype(np.float32)
+
+    # 5 — RGB brightness jitter (only when colour channels present)
+    if C >= 6:
+        brightness = np.float32(np.random.uniform(0.90, 1.10))
+        pc[..., 3:6] = np.clip(pc[..., 3:6] * brightness, 0.0, 1.0)
+
+    # 6 — 5% point dropout (zero-out selected points)
+    dropout_mask = np.random.rand(T, N) < 0.05
+    pc[dropout_mask] = 0.0
+
+    return pc
+
+
+# ---------------------------------------------------------------------------
 # FPS helpers
 # ---------------------------------------------------------------------------
 
@@ -254,17 +312,8 @@ class RobosuiteDataset(BaseDataset):
     def __len__(self) -> int:
         return len(self.sampler)
 
-    def _augment_point_cloud(self, point_cloud):
-        T, N, C = point_cloud.shape
-        point_cloud[..., :3] += np.random.randn(T, N, 3).astype(np.float32) * 0.01
-        if C > 3:
-            point_cloud[..., 3:] += np.random.randn(T, N, C - 3).astype(np.float32) * 0.02
-            point_cloud[..., 3:] = np.clip(point_cloud[..., 3:], 0.0, 1.0)
-        dropout_mask = np.random.rand(T, N) < 0.25
-        point_cloud[dropout_mask] = 0.0
-        scale = np.float32(np.random.uniform(0.95, 1.05))
-        point_cloud[..., :3] *= scale
-        return point_cloud
+    def _augment_point_cloud(self, point_cloud: np.ndarray) -> np.ndarray:
+        return augment_point_cloud_sequence(point_cloud)
 
     def _sample_to_data(self, sample):
         agent_pos   = sample["state"].astype(np.float32)
