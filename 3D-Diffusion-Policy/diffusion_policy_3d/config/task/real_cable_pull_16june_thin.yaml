@@ -1,0 +1,30 @@
+name: real_cable_pull_16june_thin
+
+task_name: RealCablePull16JuneThin
+
+shape_meta: &shape_meta
+  obs:
+    point_cloud:
+      shape:
+        - ${n_points}
+        - 6
+      type: point_cloud
+    agent_pos:
+      shape: [14]
+      type: low_dim
+  action:
+    shape: [14]
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.robosuite_dataset.RobosuiteDataset
+  zarr_path: /home/rosi/3D-Diffusion-Policy/3D-Diffusion-Policy/data/real_cable_pull_16june_thin_1024.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+  n_points: ${n_points}
+
+env_runner:
+  _target_: diffusion_policy_3d.env_runner.real_robot_runner.RealRobotRunner

@@ -23,6 +23,7 @@ Run:
 import argparse
 import collections
 import queue as _queue
+import socket as _socket
 import sys
 import threading
 import time
@@ -43,7 +44,21 @@ from rtde_control import RTDEControlInterface as RTDEControl
 from rtde_receive import RTDEReceiveInterface as RTDEReceive
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "3D-Diffusion-Policy"))
-from train import TrainDP3Workspace
+sys.path.insert(0, str(Path("/home/rosi/maniflow/ManiFlow_Policy/ManiFlow")))
+
+_DP3_AVAILABLE = False
+_MANIFLOW_AVAILABLE = False
+try:
+    from train import TrainDP3Workspace
+    _DP3_AVAILABLE = True
+except ImportError:
+    pass
+try:
+    import dill as _dill
+    from maniflow.workspace.train_maniflow_robotwin_workspace import TrainManiFlowRoboTwinWorkspace
+    _MANIFLOW_AVAILABLE = True
+except ImportError:
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +190,40 @@ class CameraNode(Node):
 
 
 # ---------------------------------------------------------------------------
+# Robotiq gripper — direct TCP socket to port 63352 on the UR controller.
+# Protocol: "SET POS <0-255>\n" / "SET GTO 1\n" (Robotiq ASCII protocol).
+# This works without URCap; URScript rq_set_pos() requires URCap to be active.
+# ---------------------------------------------------------------------------
+
+class _RobotiqSocket:
+    PORT = 63352
+
+    def __init__(self, hostname: str):
+        self._lock = threading.Lock()
+        self._sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        self._sock.settimeout(3.0)
+        self._sock.connect((hostname, self.PORT))
+
+    def _cmd(self, cmd: str) -> str:
+        self._sock.sendall(cmd.encode())
+        return self._sock.recv(1024).decode().strip()
+
+    def move(self, position_01: float, speed: int = 255, force: int = 10):
+        pos = int(np.clip(position_01, 0.0, 1.0) * 255)
+        with self._lock:
+            self._cmd(f"SET POS {pos}\n")
+            self._cmd(f"SET SPE {speed}\n")
+            self._cmd(f"SET FOR {force}\n")
+            self._cmd(f"SET GTO 1\n")
+
+    def close(self):
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # BimanualRTDE — direct RTDE connection for both arms + grippers
 # (identical to 3D-Diffusion-Policy/policy_executor.py)
 # ---------------------------------------------------------------------------
@@ -196,6 +245,16 @@ class BimanualRTDE:
         self._g1_pos = 1.0   # gripper1 starts closed (matches training init)
         self._g2_pos = 0.0   # gripper2 starts open
         print("RTDE connected.")
+
+        # Gripper socket connections (Robotiq TCP protocol, port 63352)
+        self._grip1 = None
+        self._grip2 = None
+        for which, ip, attr in [(1, robot1_ip, "_grip1"), (2, robot2_ip, "_grip2")]:
+            try:
+                setattr(self, attr, _RobotiqSocket(ip))
+                print(f"Gripper{which} socket connected ({ip}:63352).")
+            except Exception as e:
+                print(f"[WARN] Gripper{which} socket failed ({ip}:63352): {e} — gripper disabled")
 
     def get_state(self) -> np.ndarray:
         """14-D [r1(6), g1(1), r2(6), g2(1)] — arms from RTDE, grippers local."""
@@ -219,16 +278,16 @@ class BimanualRTDE:
             return
         pos_byte = int(np.clip(position_01, 0.0, 1.0) * 255)
         print(f"[GRIPPER] gripper{which}: {cur:.2f}→{position_01:.2f}  (byte={pos_byte})")
-        script = f"def grip():\n  rq_set_pos({pos_byte})\nend\ngrip()\n"
-        rc = self.rc1 if which == 1 else self.rc2
-        def _send():
-            try:
-                ok = rc.sendCustomScript(script)
-                if not ok:
-                    print(f"[WARN] gripper{which} sendCustomScript returned False")
-            except Exception as e:
-                print(f"[WARN] gripper{which} command failed: {e}")
-        threading.Thread(target=_send, daemon=True).start()
+        grip = self._grip1 if which == 1 else self._grip2
+        if grip is not None:
+            def _send():
+                try:
+                    grip.move(position_01)
+                except Exception as e:
+                    print(f"[WARN] gripper{which} socket command failed: {e}")
+            threading.Thread(target=_send, daemon=True).start()
+        else:
+            print(f"[WARN] gripper{which} not connected — command skipped")
         if which == 1:
             self._g1_pos = float(np.clip(position_01, 0.0, 1.0))
         else:
@@ -242,6 +301,9 @@ class BimanualRTDE:
 
     def disconnect(self):
         self.stop()
+        for g in (self._grip1, self._grip2):
+            if g is not None:
+                g.close()
         self.rc1.disconnect(); self.rc2.disconnect()
         self.rr1.disconnect(); self.rr2.disconnect()
 
@@ -256,14 +318,9 @@ def interpolate_waypoints(q_from: np.ndarray, q_to: np.ndarray, n: int):
 
 def _read_n_points(cfg) -> int:
     from omegaconf import OmegaConf
-    for path in ("n_points",):
-        try:
-            v = OmegaConf.select(cfg, path)
-            if v is not None:
-                return int(v)
-        except Exception:
-            pass
-    for path in ("task.shape_meta.obs.point_cloud.shape",
+    # ManiFlow: shape_meta lives under robotwin_task
+    for path in ("robotwin_task.shape_meta.obs.point_cloud.shape",
+                 "task.shape_meta.obs.point_cloud.shape",
                  "shape_meta.obs.point_cloud.shape"):
         try:
             s = OmegaConf.select(cfg, path)
@@ -271,19 +328,73 @@ def _read_n_points(cfg) -> int:
                 return int(s[0])
         except Exception:
             pass
+    # DP3 fallback
+    for path in ("n_points",):
+        try:
+            v = OmegaConf.select(cfg, path)
+            if v is not None:
+                return int(v)
+        except Exception:
+            pass
     return 1024
 
 
+def _read_action_dim(cfg) -> int:
+    from omegaconf import OmegaConf
+    for path in ("robotwin_task.shape_meta.action.shape",
+                 "task.shape_meta.action.shape",
+                 "shape_meta.action.shape"):
+        try:
+            s = OmegaConf.select(cfg, path)
+            if s is not None:
+                return int(s[0])
+        except Exception:
+            pass
+    return 14
+
+
+def _is_maniflow_checkpoint(payload: dict) -> bool:
+    """Detect whether a checkpoint was saved by ManiFlow vs DP3."""
+    cfg = payload.get("cfg", {})
+    try:
+        from omegaconf import OmegaConf
+        return OmegaConf.select(cfg, "robotwin_task") is not None
+    except Exception:
+        return False
+
+
 def load_policy(checkpoint_path: str, inference_steps: int):
-    payload = torch.load(checkpoint_path, map_location="cpu")
+    # ManiFlow checkpoints are saved with dill; DP3 with plain pickle.
+    # Try dill first (works for both), fall back to torch.load default.
+    try:
+        import dill as _pkl
+    except ImportError:
+        import pickle as _pkl
+
+    payload = torch.load(checkpoint_path, map_location="cpu", pickle_module=_pkl)
     cfg = payload["cfg"]
     cfg.policy.num_inference_steps = inference_steps
-    ws = TrainDP3Workspace(cfg)
-    ws.load_payload(payload, exclude_keys=None, include_keys=None)
+
+    if _is_maniflow_checkpoint(payload):
+        if not _MANIFLOW_AVAILABLE:
+            raise RuntimeError(
+                "ManiFlow checkpoint detected but ManiFlow package not importable. "
+                "Check /home/rosi/maniflow/ManiFlow_Policy/ManiFlow is on sys.path."
+            )
+        print("[load_policy] ManiFlow checkpoint detected.")
+        ws = TrainManiFlowRoboTwinWorkspace(cfg)
+        ws.load_payload(payload)
+    else:
+        if not _DP3_AVAILABLE:
+            raise RuntimeError("DP3 checkpoint detected but DP3 package not importable.")
+        print("[load_policy] DP3 checkpoint detected.")
+        ws = TrainDP3Workspace(cfg)
+        ws.load_payload(payload, exclude_keys=None, include_keys=None)
+
     policy = ws.ema_model if cfg.training.use_ema else ws.model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     policy.to(device).eval()
-    return policy, device, _read_n_points(cfg)
+    return policy, device, _read_n_points(cfg), _read_action_dim(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +411,8 @@ def main():
     parser.add_argument("--rtde_hz",        type=int,   default=None, help="RTDE servo Hz")
     parser.add_argument("--n_action_steps", type=int,   default=None)
     parser.add_argument("--infer_steps",    type=int,   default=None)
-    parser.add_argument("--max_step",       type=float, default=0.05, help="Max joint delta per step")
+    parser.add_argument("--max_step",       type=float, default=0.05, help="Max joint delta per step (rad)")
+    parser.add_argument("--speed_scale",    type=float, default=1.0,  help="Scale all joint deltas (0.0-1.0); 0.5 = half speed")
     parser.add_argument("--no_kickstart",   action="store_true")
     args = parser.parse_args()
 
@@ -316,13 +428,15 @@ def main():
     ckpt          = args.checkpoint     or cfg["policy"]["checkpoint_path"]
     ws            = cfg["workspace"]
     max_step      = args.max_step
+    speed_scale   = float(np.clip(args.speed_scale, 0.05, 2.0))
     interp_steps  = max(1, rtde_hz // hz)
 
     print(f"Loading policy from: {ckpt}")
-    policy, device, n_points = load_policy(ckpt, infer_steps)
-    print(f"Policy loaded on {device}  |  n_points={n_points}")
+    policy, device, n_points, action_dim = load_policy(ckpt, infer_steps)
+    print(f"Policy loaded on {device}  |  n_points={n_points}  action_dim={action_dim}")
     print(f"hz={hz}  rtde_hz={rtde_hz}  n_action_steps={n_action_steps}"
-          f"  infer_steps={infer_steps}  interp_steps={interp_steps}")
+          f"  infer_steps={infer_steps}  interp_steps={interp_steps}"
+          f"  speed_scale={speed_scale:.2f}")
 
     # ── ROS2 camera ──
     rclpy.init()
@@ -336,6 +450,9 @@ def main():
 
     # ── RTDE robot connections ──
     robots = BimanualRTDE(robot1_ip, robot2_ip, rtde_hz)
+    r1_start = np.array(robots.rr1.getActualQ(), dtype=np.float64)
+    if action_dim == 8:
+        print(f"r1 locked at: {np.round(r1_start, 4).tolist()}")
 
     # ── GPU warm-up ──
     dummy_pc  = torch.zeros(1, 2, n_points, 6).to(device)
@@ -427,53 +544,70 @@ def main():
             actions  = result["action"].squeeze(0).cpu().numpy()   # (n_action_steps, 14)
 
             raw_d = actions[0].copy()
-            print(
-                f"  infer={infer_ms:4.0f}ms"
-                f"  r1_Δmax={np.abs(raw_d[0:6]).max():.4f}"
-                f"  r2_Δmax={np.abs(raw_d[7:13]).max():.4f}"
-                f"  g1_Δ={raw_d[6]:.3f}  g2_Δ={raw_d[13]:.3f}",
-                flush=True,
-            )
+            if action_dim == 8:
+                print(
+                    f"  infer={infer_ms:4.0f}ms"
+                    f"  r2_Δmax={np.abs(raw_d[0:6]).max():.4f}"
+                    f"  g1={raw_d[6]:.3f}  g2={raw_d[7]:.3f}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  infer={infer_ms:4.0f}ms"
+                    f"  r1_Δmax={np.abs(raw_d[0:6]).max():.4f}"
+                    f"  r2_Δmax={np.abs(raw_d[7:13]).max():.4f}"
+                    f"  g1_Δ={raw_d[6]:.3f}  g2_Δ={raw_d[13]:.3f}",
+                    flush=True,
+                )
 
-            # Accumulate deltas → absolute targets; apply gripper latch
-            q1_base = state_now[0:6].copy().astype(np.float64)
-            q2_base = state_now[7:13].copy().astype(np.float64)
-            g1_abs  = g1_abs_carry
-            g2_abs  = g2_abs_carry
+            # Accumulate deltas → absolute targets; apply gripper handling
+            g1_abs = g1_abs_carry
+            g2_abs = g2_abs_carry
 
-            for i in range(len(actions)):
-                for j in range(6):
-                    d = np.clip(float(actions[i, j]), -max_step, max_step)
-                    actions[i, j] = q1_base[j] + d
-                q1_base = actions[i, 0:6].copy()
+            if action_dim == 8:
+                # 8D: [r2j0-5(0:6), g1(6), g2(7)] — r1 locked, grippers as absolute states
+                q2_base = state_now[7:13].copy().astype(np.float64)
+                for i in range(len(actions)):
+                    for j in range(6):
+                        d = np.clip(float(actions[i, j]), -max_step, max_step)
+                        actions[i, j] = q2_base[j] + d
+                    q2_base = actions[i, 0:6].copy()
+                    actions[i, 6] = 1.0 if float(actions[i, 6]) > 0.5 else 0.0
+                    actions[i, 7] = 1.0 if float(actions[i, 7]) > 0.5 else 0.0
+                g1_abs_carry = float(actions[-1, 6])
+                g2_abs_carry = float(actions[-1, 7])
+            else:
+                # 14D: store raw clipped deltas — accumulation to absolute targets
+                # happens at execution time using the actual robot position then,
+                # not the stale state_now captured 800ms before the chunk runs.
+                for i in range(len(actions)):
+                    for j in range(6):
+                        actions[i, j]   = np.clip(float(actions[i, j]),   -max_step, max_step) * speed_scale
+                    for j in range(6):
+                        actions[i, 7+j] = np.clip(float(actions[i, 7+j]), -max_step, max_step) * speed_scale
 
-                for j in range(6):
-                    d = np.clip(float(actions[i, 7 + j]), -max_step, max_step)
-                    actions[i, 7 + j] = q2_base[j] + d
-                q2_base = actions[i, 7:13].copy()
+                    g1_d   = np.clip(float(actions[i, 6]),  -max_step, max_step)
+                    g1_abs = float(np.clip(g1_abs + g1_d, 0.0, 1.0))
+                    if g1_abs >= 0.99:
+                        g1_latch_count += 1
+                    if g1_latch_count >= LATCH_COUNT:
+                        g1_latched = True
+                    if g1_latched:
+                        g1_abs = 1.0
+                    actions[i, 6] = g1_abs
 
-                g1_d  = np.clip(float(actions[i, 6]),  -max_step, max_step)
-                g1_abs = float(np.clip(g1_abs + g1_d, 0.0, 1.0))
-                if g1_abs >= 0.99:
-                    g1_latch_count += 1
-                if g1_latch_count >= LATCH_COUNT:
-                    g1_latched = True
-                if g1_latched:
-                    g1_abs = 1.0
-                actions[i, 6] = g1_abs
+                    g2_d   = np.clip(float(actions[i, 13]), -max_step, max_step)
+                    g2_abs = float(np.clip(g2_abs + g2_d, 0.0, 1.0))
+                    if g2_abs >= 0.5:
+                        g2_latch_count += 1
+                    if g2_latch_count >= LATCH_COUNT:
+                        g2_latched = True
+                    if g2_latched:
+                        g2_abs = 1.0
+                    actions[i, 13] = g2_abs
 
-                g2_d  = np.clip(float(actions[i, 13]), -max_step, max_step)
-                g2_abs = float(np.clip(g2_abs + g2_d, 0.0, 1.0))
-                if g2_abs >= 0.99:
-                    g2_latch_count += 1
-                if g2_latch_count >= LATCH_COUNT:
-                    g2_latched = True
-                if g2_latched:
-                    g2_abs = 1.0
-                actions[i, 13] = g2_abs
-
-            g1_abs_carry = g1_abs
-            g2_abs_carry = g2_abs
+                g1_abs_carry = g1_abs
+                g2_abs_carry = g2_abs
 
             try:
                 action_queue.put(actions, timeout=0.1)
@@ -487,17 +621,64 @@ def main():
     first_actions = action_queue.get()
     print("First action ready — starting execution.\n")
 
+    # ── Start-position check against training distribution ──
+    if action_dim != 8:
+        _TRAIN_R1_MEAN_DEG = np.array([-54.88, -109.99,  144.20, -196.41, -115.81,   14.32])
+        _TRAIN_R2_MEAN_DEG = np.array([-123.12,  -82.98, -140.53,   33.87, -235.15,  -13.22])
+        _TRAIN_R1_STD_DEG  = np.array([0.04, 0.06, 0.04, 1.03, 0.70, 0.31])
+        _TRAIN_R2_STD_DEG  = np.array([0.94, 1.31, 0.57, 0.57, 0.62, 0.12])
+        _q1_now, _q2_now = robots.get_joints()
+        _q1_deg = np.rad2deg(np.array(_q1_now))
+        _q2_deg = np.rad2deg(np.array(_q2_now))
+        _r1_err = _q1_deg - _TRAIN_R1_MEAN_DEG
+        _r2_err = _q2_deg - _TRAIN_R2_MEAN_DEG
+        _r1_sigma = np.abs(_r1_err) / _TRAIN_R1_STD_DEG
+        _r2_sigma = np.abs(_r2_err) / _TRAIN_R2_STD_DEG
+        print("─" * 70)
+        print("START POSITION CHECK  (values in degrees, Δ = actual − training mean)")
+        print(f"{'Joint':<8} {'R1 actual':>10} {'R1 Δ':>8} {'σ':>5}   {'R2 actual':>10} {'R2 Δ':>8} {'σ':>5}")
+        print("─" * 70)
+        for j in range(6):
+            r1_flag = " !" if _r1_sigma[j] > 3 else ("  " if _r1_sigma[j] <= 1 else " ~")
+            r2_flag = " !" if _r2_sigma[j] > 3 else ("  " if _r2_sigma[j] <= 1 else " ~")
+            print(f"  j{j}    {_q1_deg[j]:>10.2f} {_r1_err[j]:>+8.2f} {_r1_sigma[j]:>4.1f}σ{r1_flag}"
+                  f"  {_q2_deg[j]:>10.2f} {_r2_err[j]:>+8.2f} {_r2_sigma[j]:>4.1f}σ{r2_flag}")
+        print("─" * 70)
+        r1_ok = np.all(_r1_sigma <= 3)
+        r2_ok = np.all(_r2_sigma <= 3)
+        print(f"R1: {'OK' if r1_ok else 'OUT OF DISTRIBUTION — adjust before running'}   "
+              f"R2: {'OK' if r2_ok else 'OUT OF DISTRIBUTION — adjust before running'}")
+        print("─" * 70)
+        print()
+
     # ── Main control loop ──
     try:
         print(f"=== DP3 Execution  ({n_action_steps} steps/chunk @ {hz} Hz, Ctrl+C to stop) ===\n")
         actions = first_actions
         while True:
+            # 14D: re-base delta accumulation to actual robot position at chunk start.
+            # inference_worker stores raw clipped deltas; we accumulate here so that
+            # each chunk starts from where the robot actually is, not from the stale
+            # state_now captured ~800 ms before this chunk runs.
+            if action_dim != 8:
+                _q1c, _q2c = robots.get_joints()
+                q1_exec_base = np.array(_q1c, dtype=np.float64)
+                q2_exec_base = np.array(_q2c, dtype=np.float64)
+
             for step_idx in range(n_action_steps):
-                act       = actions[step_idx]
-                q1_target = act[0:6]
-                q2_target = act[7:13]
-                g1_target = float(act[6])
-                g2_target = float(act[13])
+                act = actions[step_idx]
+                if action_dim == 8:
+                    q1_target = r1_start
+                    q2_target = act[0:6]
+                    g1_target = float(act[6])
+                    g2_target = float(act[7])
+                else:
+                    q1_target = q1_exec_base + act[0:6]
+                    q2_target = q2_exec_base + act[7:13]
+                    q1_exec_base = q1_target.copy()
+                    q2_exec_base = q2_target.copy()
+                    g1_target = float(act[6])
+                    g2_target = float(act[13])
 
                 q1_cur, q2_cur = robots.get_joints()
                 for q1_wp, q2_wp in zip(
@@ -519,6 +700,17 @@ def main():
 
     except KeyboardInterrupt:
         print("\nStopping ...")
+        if action_dim != 8:
+            try:
+                _q1f, _q2f = robots.get_joints()
+                _q2f_deg = np.round(np.rad2deg(np.array(_q2f)), 2)
+                _q2s_deg = np.array([-123.12, -82.98, -140.53, 33.87, -235.15, -13.22])
+                _q2_off  = np.round(_q2f_deg - _q2s_deg, 2)
+                print(f"\nR2 terminal joints (deg): {_q2f_deg.tolist()}")
+                print(f"R2 offset from training start: {_q2_off.tolist()}")
+                print("→ Place cable at the R2 terminal position if gripper missed.")
+            except Exception:
+                pass
     finally:
         stop_infer.set()
         stop_obs.set()
