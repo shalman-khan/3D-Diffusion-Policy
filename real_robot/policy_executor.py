@@ -23,6 +23,7 @@ Run:
 import argparse
 import collections
 import queue as _queue
+import signal
 import socket as _socket
 import sys
 import threading
@@ -429,7 +430,7 @@ def main():
     ws            = cfg["workspace"]
     max_step      = args.max_step
     speed_scale   = float(np.clip(args.speed_scale, 0.05, 2.0))
-    interp_steps  = max(1, rtde_hz // hz)
+    interp_steps  = int(max(1, rtde_hz // hz))
 
     print(f"Loading policy from: {ckpt}")
     policy, device, n_points, action_dim = load_policy(ckpt, infer_steps)
@@ -650,6 +651,12 @@ def main():
               f"R2: {'OK' if r2_ok else 'OUT OF DISTRIBUTION — adjust before running'}")
         print("─" * 70)
         print()
+
+    def _handle_stop(sig, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT,  _handle_stop)
 
     # ── Main control loop ──
     try:
